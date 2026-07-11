@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Secrets
+.env
+
+# Local state and backups
+history.json
+data/
+backups/
+
+# OS/editor
+.DS_Store
+.vscode/
+
+# Tunnel leftovers
+*.log

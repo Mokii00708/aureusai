@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: mikel-presentation-chat
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 2 -k gthread -b 0.0.0.0:$PORT app:app
+    envVars:
+      - key: FLASK_DEBUG
+        value: "0"
+      - key: HOST
+        value: "0.0.0.0"
+      - key: AUTO_LEARN_ENABLED
+        value: "1"
+      - key: AUTO_LEARN_INTERVAL_SECONDS
+        value: "900"
+      - key: AUTO_LEARN_IDLE_SECONDS
+        value: "300"
+      - key: AUTO_LEARN_TOPIC_LIMIT
+        value: "3"
+      - key: APP_SECRET
+        generateValue: true
+      - key: OPENAI_API_KEY
+        sync: false
