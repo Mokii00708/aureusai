@@ -3522,6 +3522,12 @@ def linguistic_engine_parse_intent(user_message):
     normalized = normalize_intent_text(user_message)
     raw_lower = normalize_case(user_message)
 
+    chart_spec = parse_graph_request(user_message)
+    if chart_spec:
+        if chart_spec.get("error"):
+            return {"action": "chart_error", "error": chart_spec.get("error")}
+        return {"action": "chart_generate", "chart_spec": chart_spec}
+
     watchlist_cmd = detect_watchlist_command(normalized)
     if watchlist_cmd:
         symbols = []
@@ -3611,6 +3617,28 @@ def analytical_engine_execute(user_id, user_state, intent):
     if action == "watchlist_show":
         reply_text = get_watchlist_summary_reply(user_state, include_sources=False)
         return {"ok": True, "action": action, "state_changed": True, "text": reply_text, "source": "https://finance.yahoo.com/"}
+
+    if action == "chart_error":
+        return {"ok": True, "action": action, "state_changed": False, "text": intent.get("error") or "Invalid chart request."}
+
+    if action == "chart_generate":
+        chart_spec = intent.get("chart_spec") or {}
+        chart_url, _cfg = build_quickchart_url(chart_spec)
+        chart_type = chart_spec.get("chart_type") or "line"
+        values = chart_spec.get("values") or []
+        text = (
+            f"Generated a {chart_type} chart with {len(values)} data points.\n"
+            f"Chart link: {chart_url}"
+        )
+        return {
+            "ok": True,
+            "action": action,
+            "state_changed": False,
+            "text": text,
+            "source": chart_url,
+            "chart_url": chart_url,
+            "chart_spec": chart_spec,
+        }
 
     if action == "watchlist_clear":
         finance_profile["watchlist"] = []
@@ -3866,6 +3894,136 @@ def linguistic_engine_render_response(engine_result, include_sources=False):
     if include_sources and engine_result.get("source"):
         return with_citations(text, [engine_result.get("source")], True)
     return text
+
+
+def parse_graph_request(user_message):
+    """Parse natural-language chart requests into structured chart specs."""
+    raw = (user_message or "").strip()
+    lowered = normalize_case(raw)
+    trigger_words = ["graph", "chart", "plot", "visualize", "visualise"]
+    if not any(word in lowered for word in trigger_words):
+        return None
+
+    chart_type = "line"
+    if any(k in lowered for k in ["bar chart", "bar graph", "histogram", "bars", "graph bar", "plot bar", "bar "]):
+        chart_type = "bar"
+    elif any(k in lowered for k in ["pie chart", "donut", "doughnut", "graph pie", "plot pie"]):
+        chart_type = "pie"
+    elif any(k in lowered for k in ["scatter", "scatterplot", "scatter plot"]):
+        chart_type = "scatter"
+    elif any(k in lowered for k in ["line chart", "line graph", "trend line"]):
+        chart_type = "line"
+
+    title_match = re.search(r"(?:title|called|name it)\s+['\"]?([^'\"\n]+)['\"]?", raw, flags=re.IGNORECASE)
+    title = (title_match.group(1).strip() if title_match else "User Requested Chart")
+
+    xy_pairs = []
+    for match in re.finditer(r"([A-Za-z0-9_.\- ]{1,30})\s*[:=]\s*(-?\d+(?:\.\d+)?)", raw):
+        label = re.sub(r"\s+", " ", match.group(1)).strip(" ,")
+        try:
+            value = float(match.group(2))
+        except Exception:
+            continue
+        if label:
+            xy_pairs.append((label, value))
+
+    labels = []
+    values = []
+    if xy_pairs:
+        for label, value in xy_pairs[:30]:
+            labels.append(label)
+            values.append(value)
+    else:
+        num_matches = re.findall(r"-?\d+(?:\.\d+)?", raw)
+        parsed = []
+        for token in num_matches[:30]:
+            try:
+                parsed.append(float(token))
+            except Exception:
+                continue
+        if len(parsed) >= 2:
+            labels = [str(i + 1) for i in range(len(parsed))]
+            values = parsed
+
+    if not values:
+        return {
+            "error": "I couldn't detect data points. Provide values like: graph bar revenue:120, costs:80, profit:40",
+        }
+
+    x_label_match = re.search(r"x\s*label\s*[:=]\s*([A-Za-z0-9\s\-_/]{1,40})", raw, flags=re.IGNORECASE)
+    y_label_match = re.search(r"y\s*label\s*[:=]\s*([A-Za-z0-9\s\-_/]{1,40})", raw, flags=re.IGNORECASE)
+    x_label = x_label_match.group(1).strip() if x_label_match else ""
+    y_label = y_label_match.group(1).strip() if y_label_match else ""
+
+    return {
+        "chart_type": chart_type,
+        "title": title,
+        "labels": labels,
+        "values": values,
+        "x_label": x_label,
+        "y_label": y_label,
+    }
+
+
+def build_quickchart_url(chart_spec):
+    """Build a QuickChart URL from chart spec for easy rendering."""
+    chart_type = chart_spec.get("chart_type") or "line"
+    labels = chart_spec.get("labels") or []
+    values = chart_spec.get("values") or []
+    title = chart_spec.get("title") or "Chart"
+    x_label = chart_spec.get("x_label") or ""
+    y_label = chart_spec.get("y_label") or ""
+
+    base_color = "rgb(46, 134, 193)"
+    config = {
+        "type": chart_type,
+        "data": {
+            "labels": labels,
+            "datasets": [
+                {
+                    "label": title,
+                    "data": values,
+                    "borderColor": base_color,
+                    "backgroundColor": "rgba(46, 134, 193, 0.35)",
+                    "fill": chart_type == "line",
+                }
+            ],
+        },
+        "options": {
+            "plugins": {
+                "legend": {"display": chart_type != "pie"},
+                "title": {"display": True, "text": title},
+            },
+            "scales": {
+                "x": {"title": {"display": bool(x_label), "text": x_label}},
+                "y": {"title": {"display": bool(y_label), "text": y_label}},
+            },
+        },
+    }
+
+    chart_json = json.dumps(config, separators=(",", ":"))
+    return f"https://quickchart.io/chart?width=900&height=520&c={quote_plus(chart_json)}", config
+
+
+def get_chart_reply_from_request(user_message, include_sources=False):
+    """Generate chart URL from natural language and return user-facing text."""
+    parsed = parse_graph_request(user_message)
+    if not parsed:
+        return ""
+    if parsed.get("error"):
+        return parsed["error"]
+
+    chart_url, _cfg = build_quickchart_url(parsed)
+    chart_type = parsed.get("chart_type") or "line"
+    point_count = len(parsed.get("values") or [])
+    preview_values = ", ".join(f"{v:g}" for v in (parsed.get("values") or [])[:8])
+    text = (
+        f"Generated a {chart_type} chart with {point_count} data points. "
+        f"Preview values: {preview_values}.\n"
+        f"Chart link: {chart_url}\n"
+        "If you want, I can regenerate it with different colors, labels, or chart type."
+    )
+    return with_citations(text, [chart_url], include_sources)
 
 
 def extract_country_from_text(normalized_text):
@@ -6198,6 +6356,48 @@ def api_finance_geopolitical_scan():
         "home_country": HOME_COUNTRY,
         "report": report_text,
         "sources": sources,
+    })
+
+
+@app.route("/api/charts/generate", methods=["POST"])
+def api_generate_chart():
+    """Generate a chart URL/config from natural language or explicit chart payload."""
+    mark_user_activity()
+    if reject_large_request(16384):
+        return jsonify({"error": "Payload too large."}), 413
+
+    data = request.get_json(silent=True) or {}
+    prompt = (data.get("prompt") or "").strip()
+    chart_spec = data.get("chart_spec")
+
+    if chart_spec and isinstance(chart_spec, dict):
+        spec = {
+            "chart_type": chart_spec.get("chart_type") or "line",
+            "title": chart_spec.get("title") or "User Requested Chart",
+            "labels": chart_spec.get("labels") or [],
+            "values": chart_spec.get("values") or [],
+            "x_label": chart_spec.get("x_label") or "",
+            "y_label": chart_spec.get("y_label") or "",
+        }
+        if not spec["values"]:
+            return jsonify({"error": "chart_spec.values is required."}), 400
+    else:
+        if not prompt:
+            return jsonify({"error": "Provide prompt or chart_spec."}), 400
+        parsed = parse_graph_request(prompt)
+        if not parsed:
+            return jsonify({"error": "Could not parse chart request from prompt."}), 400
+        if parsed.get("error"):
+            return jsonify({"error": parsed.get("error")}), 400
+        spec = parsed
+
+    chart_url, cfg = build_quickchart_url(spec)
+    return jsonify({
+        "status": "ok",
+        "as_of_utc": utc_now_iso(),
+        "chart_url": chart_url,
+        "chart_spec": spec,
+        "chart_config": cfg,
     })
 
 
