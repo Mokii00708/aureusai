@@ -4,6 +4,7 @@ import json
 import re
 import ast
 import math
+import sqlite3
 import ssl
 import random
 import difflib
@@ -43,6 +44,7 @@ USER_MEMORY_DIR = os.path.join(DATA_DIR, "users")
 LEARNING_FILE = os.path.join(DATA_DIR, "learning_memory.json")
 ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
 SESSIONS_FILE = os.path.join(DATA_DIR, "sessions.json")
+ANALYTICS_DB_FILE = os.path.join(DATA_DIR, "analytics_engine.db")
 DEFAULT_USER_ID = "guest"
 APP_SECRET = os.getenv("APP_SECRET") or API_KEY
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "2592000"))
@@ -60,6 +62,7 @@ idle_worker_started = False
 idle_learning_lock = threading.Lock()
 auth_rate_limit_lock = threading.Lock()
 auth_rate_limit_hits = {}
+analytics_db_lock = threading.Lock()
 finance_cache_lock = threading.Lock()
 finance_quote_cache = {}
 FINANCE_QUOTE_CACHE_TTL_SECONDS = int(os.getenv("FINANCE_QUOTE_CACHE_TTL_SECONDS", "60"))
@@ -103,6 +106,55 @@ def ensure_storage_dirs():
     """Ensure persistent storage folders exist."""
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(USER_MEMORY_DIR, exist_ok=True)
+    ensure_analytics_db()
+
+
+def ensure_analytics_db():
+    """Initialize SQL tables used by the analytical finance engine."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with analytics_db_lock:
+        conn = sqlite3.connect(ANALYTICS_DB_FILE)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS spend_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    category TEXT NOT NULL,
+                    day_of_week TEXT NOT NULL,
+                    hour INTEGER NOT NULL,
+                    stress_level TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    user_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    monthly_cost REAL NOT NULL,
+                    days_since_last_use INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (user_id, name)
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS savings_goals (
+                    user_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def utc_now_iso():
@@ -1185,6 +1237,7 @@ def get_ai_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True
     finance_direct_reply, finance_changed = get_personal_finance_feature_reply(
         user_message,
         user_state,
+        user_id=user_id,
         include_sources=wants_citations,
     )
     if finance_direct_reply:
@@ -1274,6 +1327,7 @@ def get_ai_response_sync(user_message, user_id=DEFAULT_USER_ID, remember_history
     finance_direct_reply, finance_changed = get_personal_finance_feature_reply(
         user_message,
         user_state,
+        user_id=user_id,
         include_sources=wants_citations,
     )
     if finance_direct_reply:
@@ -2757,10 +2811,24 @@ def apply_subscription_command(user_state, user_message, include_sources=False):
     return "", False
 
 
-def get_personal_finance_feature_reply(user_message, user_state, include_sources=False):
+def get_personal_finance_feature_reply(user_message, user_state, user_id=DEFAULT_USER_ID, include_sources=False):
     """Handle watchlist/subscription commands before generic model responses."""
     user_state = ensure_finance_profiles(user_state)
     normalized = normalize_intent_text(user_message)
+
+    # Two-engine architecture:
+    # 1) Linguistic engine parses natural language into structured analytical intent.
+    # 2) Analytical engine executes deterministic math/state/SQL logic.
+    structured_intent = linguistic_engine_parse_intent(user_message)
+    if structured_intent:
+        engine_result = analytical_engine_execute(
+            user_id=sanitize_user_id(user_id),
+            user_state=user_state,
+            intent=structured_intent,
+        )
+        rendered = linguistic_engine_render_response(engine_result, include_sources=include_sources)
+        if rendered:
+            return rendered, bool(engine_result.get("state_changed"))
 
     watchlist_reply, watchlist_changed = apply_watchlist_command(
         user_state, user_message, include_sources=include_sources
@@ -2931,6 +2999,428 @@ def build_weekly_finance_report_lines(user_state):
         lines.append(f"- {nudge}")
 
     return lines
+
+
+def analytics_sql_upsert_subscription(user_id, item):
+    """Persist subscription row into SQL analytical store."""
+    ensure_analytics_db()
+    with analytics_db_lock:
+        conn = sqlite3.connect(ANALYTICS_DB_FILE)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO subscriptions (user_id, name, monthly_cost, days_since_last_use, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, name) DO UPDATE SET
+                    monthly_cost=excluded.monthly_cost,
+                    days_since_last_use=excluded.days_since_last_use,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    user_id,
+                    item.get("name") or "",
+                    float(item.get("monthly_cost") or 0.0),
+                    int(item.get("days_since_last_use") or 0),
+                    item.get("updated_at") or utc_now_iso(),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def analytics_sql_delete_subscription(user_id, name):
+    """Delete a subscription row from SQL analytical store."""
+    ensure_analytics_db()
+    with analytics_db_lock:
+        conn = sqlite3.connect(ANALYTICS_DB_FILE)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "DELETE FROM subscriptions WHERE user_id = ? AND lower(name) = lower(?)",
+                (user_id, name),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def analytics_sql_set_goal(user_id, goal_name, goal_amount):
+    """Persist savings goal in SQL analytical store."""
+    ensure_analytics_db()
+    with analytics_db_lock:
+        conn = sqlite3.connect(ANALYTICS_DB_FILE)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO savings_goals (user_id, name, amount, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    name=excluded.name,
+                    amount=excluded.amount,
+                    updated_at=excluded.updated_at
+                """,
+                (user_id, goal_name, float(goal_amount), utc_now_iso()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def analytics_sql_insert_spend_event(user_id, event):
+    """Insert spend event into SQL analytical store."""
+    ensure_analytics_db()
+    with analytics_db_lock:
+        conn = sqlite3.connect(ANALYTICS_DB_FILE)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO spend_events (user_id, amount, category, day_of_week, hour, stress_level, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    float(event.get("amount") or 0.0),
+                    (event.get("category") or "other").strip().lower(),
+                    event.get("day_of_week") or datetime.now().strftime("%A"),
+                    int(event.get("hour") or datetime.now().hour),
+                    (event.get("stress_level") or "medium").strip().lower(),
+                    event.get("timestamp") or utc_now_iso(),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def analytics_sql_behavior_insights(user_id):
+    """Compute behavioral spending aggregates using SQL."""
+    ensure_analytics_db()
+    with analytics_db_lock:
+        conn = sqlite3.connect(ANALYTICS_DB_FILE)
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*), COALESCE(AVG(amount), 0) FROM spend_events WHERE user_id = ?", (user_id,))
+            row = cur.fetchone() or (0, 0)
+            event_count = int(row[0] or 0)
+            avg_all = float(row[1] or 0.0)
+
+            cur.execute(
+                """
+                SELECT COALESCE(AVG(amount), 0)
+                FROM spend_events
+                WHERE user_id = ? AND day_of_week = 'Friday' AND hour >= 17
+                """,
+                (user_id,),
+            )
+            friday_avg = float((cur.fetchone() or (0,))[0] or 0.0)
+
+            cur.execute(
+                "SELECT COALESCE(AVG(amount), 0) FROM spend_events WHERE user_id = ? AND stress_level = 'high'",
+                (user_id,),
+            )
+            stress_avg = float((cur.fetchone() or (0,))[0] or 0.0)
+
+            cur.execute(
+                """
+                SELECT category, COALESCE(SUM(amount), 0) AS total
+                FROM spend_events
+                WHERE user_id = ?
+                GROUP BY category
+                ORDER BY total DESC
+                LIMIT 1
+                """,
+                (user_id,),
+            )
+            cat_row = cur.fetchone()
+            common_category = (cat_row[0] if cat_row else "") or ""
+
+            if avg_all <= 0:
+                friday_mult = 1.0
+                stress_mult = 1.0
+                avoidable = 0.0
+            else:
+                friday_mult = (friday_avg / avg_all) if friday_avg > 0 else 1.0
+                stress_mult = (stress_avg / avg_all) if stress_avg > 0 else 1.0
+                avoidable = max(0.0, friday_avg - avg_all)
+
+            trigger_parts = []
+            if friday_mult >= 1.2:
+                trigger_parts.append("Friday evening")
+            if stress_mult >= 1.2:
+                trigger_parts.append("high-stress days")
+
+            return {
+                "event_count": event_count,
+                "top_trigger": " and ".join(trigger_parts),
+                "friday_late_multiplier": friday_mult,
+                "high_stress_multiplier": stress_mult,
+                "common_category": common_category,
+                "estimated_avoidable_spend": avoidable,
+            }
+        finally:
+            conn.close()
+
+
+def linguistic_engine_parse_intent(user_message):
+    """Linguistic engine: parse natural language into analytical intent payloads."""
+    normalized = normalize_intent_text(user_message)
+
+    watchlist_cmd = detect_watchlist_command(normalized)
+    if watchlist_cmd:
+        symbols = []
+        if watchlist_cmd in {"add", "remove"}:
+            payload_text = user_message
+            for marker in ["watchlist add", "add to watchlist", "watchlist remove", "remove from watchlist", "track", "untrack"]:
+                payload_text = re.sub(marker, " ", payload_text, flags=re.IGNORECASE)
+            symbols = parse_symbol_or_company_list(payload_text)
+        return {"action": f"watchlist_{watchlist_cmd}", "symbols": symbols}
+
+    if any(x in normalized for x in ["subscription add", "add subscription"]):
+        payload = parse_subscription_add_payload(user_message)
+        if payload:
+            return {"action": "subscription_add", "payload": payload}
+
+    if any(x in normalized for x in ["subscription remove", "remove subscription"]):
+        payload = re.sub(r"subscription remove|remove subscription", " ", user_message, flags=re.IGNORECASE)
+        target = re.sub(r"\s+", " ", payload).strip(" ,.-")
+        return {"action": "subscription_remove", "name": target}
+
+    if any(x in normalized for x in ["set goal", "savings goal", "goal amount"]):
+        amount_match = re.search(r"\$?\s*([0-9]+(?:\.[0-9]+)?)", user_message)
+        if amount_match:
+            amount = float(amount_match.group(1))
+            name = re.sub(r"\$?\s*[0-9]+(?:\.[0-9]+)?", " ", user_message)
+            name = re.sub(r"\b(set|savings|goal|amount|my|for)\b", " ", name, flags=re.IGNORECASE)
+            name = re.sub(r"\s+", " ", name).strip(" ,.-") or "your savings goal"
+            return {"action": "subscription_goal_set", "name": name, "amount": amount}
+
+    if any(x in normalized for x in ["phantom burn", "subscription decay", "burn alert", "subscription alert"]):
+        return {"action": "subscription_decay_report"}
+
+    if any(x in normalized for x in ["behavior summary", "spending triggers", "show triggers", "budget psychology", "behavioral budgeting"]):
+        return {"action": "behavior_summary"}
+
+    if any(x in normalized for x in ["coach nudge", "budget nudge", "financial coach", "coach me"]):
+        return {"action": "behavior_nudge"}
+
+    if any(x in normalized for x in ["auto sweep on", "enable auto sweep"]):
+        return {"action": "auto_sweep_on"}
+
+    if any(x in normalized for x in ["auto sweep off", "disable auto sweep"]):
+        return {"action": "auto_sweep_off"}
+
+    if any(x in normalized for x in ["sweep target", "set target"]):
+        target_text = re.sub(r".*(?:sweep target|set target)", "", user_message, flags=re.IGNORECASE).strip(" :.-")
+        return {"action": "auto_sweep_target", "target": target_text}
+
+    spend_payload = parse_spend_log_payload(user_message)
+    if spend_payload:
+        return {"action": "spend_log", "payload": spend_payload}
+
+    return None
+
+
+def analytical_engine_execute(user_id, user_state, intent):
+    """Analytical engine: deterministic execution and exact math/aggregation."""
+    user_state = ensure_finance_profiles(user_state)
+    action = (intent or {}).get("action") or ""
+    if not action:
+        return {"ok": False}
+
+    finance_profile = user_state.get("finance_profile") or {}
+    subscription_profile = user_state.get("subscription_profile") or {}
+    behavior_profile = user_state.get("behavior_budget_profile") or {}
+
+    if action == "watchlist_show":
+        reply_text = get_watchlist_summary_reply(user_state, include_sources=False)
+        return {"ok": True, "action": action, "state_changed": True, "text": reply_text, "source": "https://finance.yahoo.com/"}
+
+    if action == "watchlist_clear":
+        finance_profile["watchlist"] = []
+        finance_profile["watchlist_last_snapshot"] = []
+        finance_profile["watchlist_last_checked"] = utc_now_iso()
+        user_state["finance_profile"] = finance_profile
+        return {"ok": True, "action": action, "state_changed": True, "text": "Done. Your watchlist is now empty."}
+
+    if action in {"watchlist_add", "watchlist_remove"}:
+        symbols = intent.get("symbols") or []
+        watchlist = finance_profile.get("watchlist") or []
+        if action == "watchlist_add":
+            for symbol in symbols:
+                if symbol not in watchlist:
+                    watchlist.append(symbol)
+            watchlist = watchlist[:60]
+            finance_profile["watchlist"] = watchlist
+            finance_profile["watchlist_last_checked"] = utc_now_iso()
+            user_state["finance_profile"] = finance_profile
+            if symbols:
+                return {
+                    "ok": True,
+                    "action": action,
+                    "state_changed": True,
+                    "text": f"Watchlist updated. Tracking: {', '.join(watchlist)}.",
+                }
+            return {"ok": True, "action": action, "state_changed": False, "text": "Please include at least one stock symbol or company name."}
+
+        before = len(watchlist)
+        watchlist = [symbol for symbol in watchlist if symbol not in set(symbols)]
+        finance_profile["watchlist"] = watchlist
+        finance_profile["watchlist_last_checked"] = utc_now_iso()
+        user_state["finance_profile"] = finance_profile
+        if len(watchlist) != before:
+            return {
+                "ok": True,
+                "action": action,
+                "state_changed": True,
+                "text": f"Removed from watchlist. Now tracking: {', '.join(watchlist) if watchlist else 'none' }.",
+            }
+        return {"ok": True, "action": action, "state_changed": False, "text": "None of those symbols were in your watchlist."}
+
+    if action == "subscription_add":
+        payload = intent.get("payload") or {}
+        items = subscription_profile.get("items") or []
+        existing = None
+        for item in items:
+            if normalize_case(item.get("name")) == normalize_case(payload.get("name")):
+                existing = item
+                break
+        if existing:
+            existing["monthly_cost"] = float(payload.get("monthly_cost") or 0.0)
+            existing["days_since_last_use"] = int(payload.get("days_since_last_use") or 0)
+            existing["updated_at"] = utc_now_iso()
+            action_word = "updated"
+            analytics_sql_upsert_subscription(user_id, existing)
+        else:
+            row = {
+                "name": payload.get("name") or "",
+                "monthly_cost": float(payload.get("monthly_cost") or 0.0),
+                "days_since_last_use": int(payload.get("days_since_last_use") or 0),
+                "updated_at": utc_now_iso(),
+            }
+            items.append(row)
+            action_word = "added"
+            analytics_sql_upsert_subscription(user_id, row)
+        subscription_profile["items"] = items[:120]
+        subscription_profile["last_alert_at"] = utc_now_iso()
+        user_state["subscription_profile"] = subscription_profile
+        return {
+            "ok": True,
+            "action": action,
+            "state_changed": True,
+            "text": (
+                f"Subscription {action_word}: {payload.get('name')} at ${float(payload.get('monthly_cost') or 0):.2f}/mo, "
+                f"unused {int(payload.get('days_since_last_use') or 0)} days."
+            ),
+        }
+
+    if action == "subscription_remove":
+        target_name = (intent.get("name") or "").strip()
+        if not target_name:
+            return {"ok": True, "action": action, "state_changed": False, "text": "Tell me which subscription to remove."}
+        items = subscription_profile.get("items") or []
+        before = len(items)
+        items = [item for item in items if normalize_case(item.get("name")) != normalize_case(target_name)]
+        subscription_profile["items"] = items
+        subscription_profile["last_alert_at"] = utc_now_iso()
+        user_state["subscription_profile"] = subscription_profile
+        if len(items) != before:
+            analytics_sql_delete_subscription(user_id, target_name)
+            return {"ok": True, "action": action, "state_changed": True, "text": f"Removed subscription: {target_name}."}
+        return {"ok": True, "action": action, "state_changed": False, "text": "I could not find that subscription in your tracked list."}
+
+    if action == "subscription_goal_set":
+        goal_name = (intent.get("name") or "your savings goal").strip() or "your savings goal"
+        goal_amount = float(intent.get("amount") or 0.0)
+        if goal_amount <= 0:
+            return {"ok": True, "action": action, "state_changed": False, "text": "Set a valid goal amount above zero."}
+        subscription_profile["savings_goal"] = {"name": goal_name, "amount": goal_amount}
+        subscription_profile["last_alert_at"] = utc_now_iso()
+        user_state["subscription_profile"] = subscription_profile
+        analytics_sql_set_goal(user_id, goal_name, goal_amount)
+        return {"ok": True, "action": action, "state_changed": True, "text": f"Savings goal set: {goal_name} (${goal_amount:.2f})."}
+
+    if action == "subscription_decay_report":
+        report = build_subscription_decay_report(user_state, include_sources=False)
+        return {"ok": True, "action": action, "state_changed": True, "text": report}
+
+    if action == "spend_log":
+        payload = intent.get("payload") or {}
+        user_state = add_spend_event(user_state, payload)
+        analytics_sql_insert_spend_event(user_id, payload)
+        return {
+            "ok": True,
+            "action": action,
+            "state_changed": True,
+            "text": (
+                f"Spend logged: ${float(payload.get('amount') or 0):.2f} on {payload.get('category')} "
+                f"({payload.get('day_of_week')} {int(payload.get('hour') or 0):02d}:00, stress {payload.get('stress_level')})."
+            ),
+        }
+
+    if action == "behavior_summary":
+        insights = analytics_sql_behavior_insights(user_id)
+        if insights.get("event_count", 0) < 5:
+            text = "I need at least 5 spend logs to learn your emotional spending triggers accurately."
+        else:
+            lines = [
+                "Behavioral budgeting insights:",
+                f"- Logged events: {insights['event_count']}",
+                f"- Top spend category: {insights['common_category'] or 'other'}",
+                f"- Friday evening spend multiplier: {insights['friday_late_multiplier']:.2f}x",
+                f"- High-stress spend multiplier: {insights['high_stress_multiplier']:.2f}x",
+                f"- Estimated avoidable spend per trigger window: ${insights['estimated_avoidable_spend']:.2f}",
+            ]
+            if insights.get("top_trigger"):
+                lines.append(f"- Emotional trigger pattern detected: {insights['top_trigger']}")
+            text = "\n".join(lines)
+        return {"ok": True, "action": action, "state_changed": False, "text": text}
+
+    if action == "behavior_nudge":
+        nudge = build_empathetic_budget_nudge(user_state)
+        if nudge:
+            behavior_profile["last_coach_alert_at"] = utc_now_iso()
+            user_state["behavior_budget_profile"] = behavior_profile
+            return {"ok": True, "action": action, "state_changed": True, "text": nudge}
+        return {"ok": True, "action": action, "state_changed": False, "text": "No urgent trigger window detected right now. I can still help with a low-spend alternative plan."}
+
+    if action == "auto_sweep_on":
+        behavior_profile["auto_sweep_enabled"] = True
+        behavior_profile["last_coach_alert_at"] = utc_now_iso()
+        user_state["behavior_budget_profile"] = behavior_profile
+        return {"ok": True, "action": action, "state_changed": True, "text": "Auto-sweep is enabled for your coaching nudges."}
+
+    if action == "auto_sweep_off":
+        behavior_profile["auto_sweep_enabled"] = False
+        behavior_profile["last_coach_alert_at"] = utc_now_iso()
+        user_state["behavior_budget_profile"] = behavior_profile
+        return {"ok": True, "action": action, "state_changed": True, "text": "Auto-sweep is disabled."}
+
+    if action == "auto_sweep_target":
+        target = (intent.get("target") or "").strip()
+        if not target:
+            return {"ok": True, "action": action, "state_changed": False, "text": "Set target like: sweep target investment index."}
+        behavior_profile["auto_sweep_target"] = target
+        behavior_profile["last_coach_alert_at"] = utc_now_iso()
+        user_state["behavior_budget_profile"] = behavior_profile
+        return {"ok": True, "action": action, "state_changed": True, "text": f"Auto-sweep target updated to: {target}."}
+
+    return {"ok": False}
+
+
+def linguistic_engine_render_response(engine_result, include_sources=False):
+    """Linguistic engine: translate analytical outputs to user-facing empathetic response."""
+    if not engine_result or not engine_result.get("ok"):
+        return ""
+    text = (engine_result.get("text") or "").strip()
+    if not text:
+        return ""
+    if include_sources and engine_result.get("source"):
+        return with_citations(text, [engine_result.get("source")], True)
+    return text
 
 
 def extract_country_from_text(normalized_text):
@@ -3756,6 +4246,7 @@ def get_local_smart_reply(user_message, user_id=DEFAULT_USER_ID):
     finance_direct_reply, finance_changed = get_personal_finance_feature_reply(
         user_message,
         user_state,
+        user_id=user_id,
         include_sources=wants_citations,
     )
     if finance_direct_reply:
