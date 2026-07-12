@@ -225,6 +225,19 @@ def default_user_state():
             "direct": 0,
             "neutral": 0,
         },
+        "finance_profile": {
+            "watchlist": [],
+            "watchlist_last_checked": "",
+            "watchlist_last_snapshot": [],
+        },
+        "subscription_profile": {
+            "items": [],
+            "savings_goal": {
+                "name": "",
+                "amount": 0.0,
+            },
+            "last_alert_at": "",
+        },
     }
 
 
@@ -257,6 +270,36 @@ def load_user_state(user_id):
             state["learned_topics"] = {}
         if not isinstance(state.get("tone_memory"), dict):
             state["tone_memory"] = default_user_state()["tone_memory"]
+        if not isinstance(state.get("finance_profile"), dict):
+            state["finance_profile"] = default_user_state()["finance_profile"]
+        finance_profile = state.get("finance_profile") or {}
+        if not isinstance(finance_profile.get("watchlist"), list):
+            finance_profile["watchlist"] = []
+        if not isinstance(finance_profile.get("watchlist_last_snapshot"), list):
+            finance_profile["watchlist_last_snapshot"] = []
+        if not isinstance(finance_profile.get("watchlist_last_checked"), str):
+            finance_profile["watchlist_last_checked"] = ""
+        state["finance_profile"] = finance_profile
+
+        if not isinstance(state.get("subscription_profile"), dict):
+            state["subscription_profile"] = default_user_state()["subscription_profile"]
+        subscription_profile = state.get("subscription_profile") or {}
+        if not isinstance(subscription_profile.get("items"), list):
+            subscription_profile["items"] = []
+        goal = subscription_profile.get("savings_goal")
+        if not isinstance(goal, dict):
+            goal = {"name": "", "amount": 0.0}
+        goal_name = (goal.get("name") or "").strip()
+        try:
+            goal_amount = float(goal.get("amount") or 0.0)
+        except Exception:
+            goal_amount = 0.0
+        goal["name"] = goal_name
+        goal["amount"] = max(0.0, goal_amount)
+        subscription_profile["savings_goal"] = goal
+        if not isinstance(subscription_profile.get("last_alert_at"), str):
+            subscription_profile["last_alert_at"] = ""
+        state["subscription_profile"] = subscription_profile
         return state
     except Exception:
         return default_user_state()
@@ -1116,6 +1159,24 @@ def get_ai_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True
         save_user_state(user_id, user_state)
         return "Thanks for the feedback. I saved it and I will adapt how I respond from now on."
 
+    wants_citations = is_citation_request(normalize_intent_text(user_message))
+    finance_direct_reply, finance_changed = get_personal_finance_feature_reply(
+        user_message,
+        user_state,
+        include_sources=wants_citations,
+    )
+    if finance_direct_reply:
+        finance_direct_reply = apply_tone_style(finance_direct_reply, user_message)
+        if remember_history:
+            conversation_history.append({"role": "user", "content": user_message})
+            conversation_history.append({"role": "assistant", "content": finance_direct_reply})
+            conversation_history = trim_history(conversation_history)
+            user_state = update_autonomous_learning(user_state, user_message, finance_direct_reply)
+            user_state["history"] = conversation_history
+        if remember_history or finance_changed:
+            save_user_state(user_id, user_state)
+        return finance_direct_reply
+
     adaptive_system = build_adaptive_system_prompt(user_state, user_message)
     if conversation_history and conversation_history[0].get("role") == "system":
         conversation_history[0]["content"] = adaptive_system
@@ -1158,7 +1219,7 @@ def get_ai_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True
         
         return full_response
     except Exception:
-        assistant_message = get_local_smart_reply(user_message)
+        assistant_message = get_local_smart_reply(user_message, user_id=user_id)
         assistant_message = apply_tone_style(assistant_message, user_message)
         conversation_history.append({"role": "assistant", "content": assistant_message})
         save_history(conversation_history)
@@ -1186,6 +1247,25 @@ def get_ai_response_sync(user_message, user_id=DEFAULT_USER_ID, remember_history
         save_user_state(user_id, user_state)
         ack = "Thanks for the feedback. I saved it and I will improve my replies in future conversations."
         return localize_reply(ack, target_language)
+
+    wants_citations = is_citation_request(normalize_intent_text(user_message))
+    finance_direct_reply, finance_changed = get_personal_finance_feature_reply(
+        user_message,
+        user_state,
+        include_sources=wants_citations,
+    )
+    if finance_direct_reply:
+        finance_direct_reply = apply_tone_style(finance_direct_reply, user_message)
+        finance_direct_reply = localize_reply(finance_direct_reply, target_language)
+        if remember_history:
+            conversation_history.append({"role": "user", "content": user_message})
+            conversation_history.append({"role": "assistant", "content": finance_direct_reply})
+            conversation_history = trim_history(conversation_history)
+            user_state = update_autonomous_learning(user_state, user_message, finance_direct_reply)
+            user_state["history"] = conversation_history
+        if remember_history or finance_changed:
+            save_user_state(user_id, user_state)
+        return finance_direct_reply
 
     normalized_user_message = normalize_intent_text(user_message)
     profile = user_state.get("profile") or {}
@@ -1230,7 +1310,7 @@ def get_ai_response_sync(user_message, user_id=DEFAULT_USER_ID, remember_history
 
         assistant_message = (response.choices[0].message.content or "").strip()
         if not assistant_message:
-            assistant_message = get_local_smart_reply(user_message)
+            assistant_message = get_local_smart_reply(user_message, user_id=user_id)
         assistant_message = apply_tone_style(assistant_message, user_message)
         assistant_message = localize_reply(assistant_message, target_language)
 
@@ -1242,7 +1322,7 @@ def get_ai_response_sync(user_message, user_id=DEFAULT_USER_ID, remember_history
             save_user_state(user_id, user_state)
         return assistant_message
     except Exception:
-        assistant_message = get_local_smart_reply(user_message)
+        assistant_message = get_local_smart_reply(user_message, user_id=user_id)
         assistant_message = apply_tone_style(assistant_message, user_message)
         assistant_message = localize_reply(assistant_message, target_language)
         conversation_history.append({"role": "assistant", "content": assistant_message})
@@ -1959,6 +2039,444 @@ def get_finance_reply(normalized_text, original_text, include_sources=False):
             return quote_reply
 
     return ""
+
+
+def ensure_finance_profiles(user_state):
+    """Ensure finance and subscription structures exist in user state."""
+    defaults = default_user_state()
+    finance_profile = user_state.get("finance_profile")
+    if not isinstance(finance_profile, dict):
+        finance_profile = json.loads(json.dumps(defaults["finance_profile"]))
+    finance_profile.setdefault("watchlist", [])
+    finance_profile.setdefault("watchlist_last_checked", "")
+    finance_profile.setdefault("watchlist_last_snapshot", [])
+
+    # Normalize watchlist symbols.
+    normalized_watchlist = []
+    for symbol in finance_profile.get("watchlist") or []:
+        normalized = normalize_ticker_symbol(symbol)
+        if normalized and normalized not in normalized_watchlist:
+            normalized_watchlist.append(normalized)
+    finance_profile["watchlist"] = normalized_watchlist[:60]
+
+    subscription_profile = user_state.get("subscription_profile")
+    if not isinstance(subscription_profile, dict):
+        subscription_profile = json.loads(json.dumps(defaults["subscription_profile"]))
+    subscription_profile.setdefault("items", [])
+    subscription_profile.setdefault("savings_goal", {"name": "", "amount": 0.0})
+    subscription_profile.setdefault("last_alert_at", "")
+
+    goal = subscription_profile.get("savings_goal") or {}
+    goal_name = (goal.get("name") or "").strip()
+    try:
+        goal_amount = float(goal.get("amount") or 0.0)
+    except Exception:
+        goal_amount = 0.0
+    subscription_profile["savings_goal"] = {
+        "name": goal_name,
+        "amount": max(0.0, goal_amount),
+    }
+
+    cleaned_items = []
+    for item in subscription_profile.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        name = (item.get("name") or "").strip()
+        if not name:
+            continue
+        try:
+            monthly_cost = float(item.get("monthly_cost") or 0.0)
+        except Exception:
+            monthly_cost = 0.0
+        try:
+            days_since_last_use = int(float(item.get("days_since_last_use") or 0))
+        except Exception:
+            days_since_last_use = 0
+        cleaned_items.append({
+            "name": name,
+            "monthly_cost": max(0.0, monthly_cost),
+            "days_since_last_use": max(0, days_since_last_use),
+            "updated_at": item.get("updated_at") or utc_now_iso(),
+        })
+    subscription_profile["items"] = cleaned_items[:120]
+
+    user_state["finance_profile"] = finance_profile
+    user_state["subscription_profile"] = subscription_profile
+    return user_state
+
+
+def parse_symbol_or_company_list(text):
+    """Resolve symbols from either raw tickers or common company names."""
+    symbols = extract_ticker_candidates(text)
+    if not symbols:
+        for name in parse_company_name_candidates(text):
+            resolved = resolve_ticker_from_company_name(name)
+            if resolved:
+                symbols.append(resolved)
+    deduped = []
+    for symbol in symbols:
+        normalized = normalize_ticker_symbol(symbol)
+        if normalized and normalized not in deduped:
+            deduped.append(normalized)
+    return deduped
+
+
+def get_watchlist_summary_reply(user_state, include_sources=False):
+    """Return watchlist summary with latest quotes and movement snapshot."""
+    user_state = ensure_finance_profiles(user_state)
+    finance_profile = user_state.get("finance_profile") or {}
+    watchlist = finance_profile.get("watchlist") or []
+    if not watchlist:
+        return "Your watchlist is empty. Add symbols like: watchlist add AAPL,MSFT,NVDA."
+
+    try:
+        quotes, source_url = fetch_live_quotes(watchlist)
+    except Exception:
+        return "I could not fetch your watchlist prices right now."
+
+    if not quotes:
+        return "I could not fetch your watchlist prices right now."
+
+    lines = [
+        "Watchlist snapshot (latest market values):",
+        f"Refresh cadence is about every {FINANCE_QUOTE_CACHE_TTL_SECONDS} seconds.",
+    ]
+    snapshot_rows = []
+    for symbol in watchlist:
+        quote = quotes.get(symbol) or {}
+        price = quote.get("price")
+        if price is None:
+            lines.append(f"- {symbol}: unavailable")
+            continue
+        change_pct = quote.get("change_percent")
+        change_text = f"{change_pct:+.2f}%" if isinstance(change_pct, (int, float)) else "n/a"
+        market_text = format_quote_timestamp(quote.get("market_time"))
+        lines.append(f"- {symbol}: ${float(price):.2f} | change {change_text} | as of {market_text}")
+        snapshot_rows.append({
+            "symbol": symbol,
+            "price": float(price),
+            "change_percent": float(change_pct) if isinstance(change_pct, (int, float)) else None,
+            "market_time": quote.get("market_time"),
+        })
+
+    finance_profile["watchlist_last_checked"] = utc_now_iso()
+    finance_profile["watchlist_last_snapshot"] = snapshot_rows
+    user_state["finance_profile"] = finance_profile
+
+    sources = [source_url] if source_url else ["https://finance.yahoo.com/"]
+    return with_citations("\n".join(lines), sources, include_sources)
+
+
+def detect_watchlist_command(normalized_text):
+    """Return watchlist command category from normalized text."""
+    if any(x in normalized_text for x in ["watchlist clear", "clear watchlist", "reset watchlist"]):
+        return "clear"
+    if any(x in normalized_text for x in ["watchlist remove", "remove from watchlist", "untrack"]):
+        return "remove"
+    if any(x in normalized_text for x in ["watchlist add", "add to watchlist", "track ", "follow stocks"]):
+        return "add"
+    if any(x in normalized_text for x in ["my watchlist", "show watchlist", "watchlist", "watchlist update", "check watchlist"]):
+        return "show"
+    return ""
+
+
+def apply_watchlist_command(user_state, user_message, include_sources=False):
+    """Apply user watchlist commands and return reply/state-changed tuple."""
+    user_state = ensure_finance_profiles(user_state)
+    normalized = normalize_intent_text(user_message)
+    command = detect_watchlist_command(normalized)
+    if not command:
+        return "", False
+
+    finance_profile = user_state.get("finance_profile") or {}
+    watchlist = finance_profile.get("watchlist") or []
+
+    if command == "clear":
+        finance_profile["watchlist"] = []
+        finance_profile["watchlist_last_snapshot"] = []
+        finance_profile["watchlist_last_checked"] = utc_now_iso()
+        user_state["finance_profile"] = finance_profile
+        return "Done. Your watchlist is now empty.", True
+
+    if command == "show":
+        return get_watchlist_summary_reply(user_state, include_sources=include_sources), True
+
+    payload_text = user_message
+    for marker in ["watchlist add", "add to watchlist", "watchlist remove", "remove from watchlist", "track", "untrack"]:
+        payload_text = re.sub(marker, " ", payload_text, flags=re.IGNORECASE)
+
+    symbols = parse_symbol_or_company_list(payload_text)
+    if not symbols:
+        return "Please include at least one stock symbol or company name.", False
+
+    changed = False
+    if command == "add":
+        for symbol in symbols:
+            if symbol not in watchlist:
+                watchlist.append(symbol)
+                changed = True
+        watchlist = watchlist[:60]
+        finance_profile["watchlist"] = watchlist
+        finance_profile["watchlist_last_checked"] = utc_now_iso()
+        user_state["finance_profile"] = finance_profile
+        if changed:
+            reply = f"Watchlist updated. Tracking: {', '.join(watchlist)}."
+        else:
+            reply = f"Those symbols were already in your watchlist: {', '.join(symbols)}."
+        return reply, True
+
+    if command == "remove":
+        before = len(watchlist)
+        watchlist = [symbol for symbol in watchlist if symbol not in set(symbols)]
+        finance_profile["watchlist"] = watchlist
+        finance_profile["watchlist_last_checked"] = utc_now_iso()
+        user_state["finance_profile"] = finance_profile
+        changed = len(watchlist) != before
+        if changed:
+            return f"Removed from watchlist. Now tracking: {', '.join(watchlist) if watchlist else 'none' }.", True
+        return "None of those symbols were in your watchlist.", False
+
+    return "", False
+
+
+def parse_subscription_add_payload(text):
+    """Extract subscription name/cost/days from text."""
+    raw = (text or "").strip()
+    cost_match = re.search(r"\$?\s*([0-9]+(?:\.[0-9]+)?)", raw)
+    days_match = re.search(r"(\d+)\s*(?:d|day|days)", normalize_case(raw))
+    if not cost_match:
+        return None
+
+    try:
+        monthly_cost = float(cost_match.group(1))
+    except Exception:
+        return None
+    if monthly_cost <= 0:
+        return None
+
+    days_since_last_use = int(days_match.group(1)) if days_match else 0
+    name = re.sub(r"\$?\s*[0-9]+(?:\.[0-9]+)?", " ", raw)
+    name = re.sub(r"\b(?:unused|days|day|d|monthly|per month|month|cost|price|add subscription|subscription add|add)\b", " ", name, flags=re.IGNORECASE)
+    name = re.sub(r"\s+", " ", name).strip(" ,.-")
+    if not name:
+        return None
+
+    return {
+        "name": name,
+        "monthly_cost": monthly_cost,
+        "days_since_last_use": max(0, days_since_last_use),
+    }
+
+
+def utility_score_from_days(days_since_last_use):
+    """Map days since use into a utility score from 0 to 1."""
+    days = max(0, int(days_since_last_use or 0))
+    return max(0.0, min(1.0, 1.0 - (days / 45.0)))
+
+
+def build_subscription_decay_report(user_state, include_sources=False):
+    """Generate subscription utility-vs-cost report and phantom burn alert."""
+    user_state = ensure_finance_profiles(user_state)
+    subscription_profile = user_state.get("subscription_profile") or {}
+    items = subscription_profile.get("items") or []
+    if not items:
+        return "No subscriptions tracked yet. Add one like: subscription add Netflix 15.99 45 days."
+
+    ranked = []
+    total_monthly_cost = 0.0
+    total_phantom_burn = 0.0
+    decayed_items = []
+    for item in items:
+        monthly_cost = float(item.get("monthly_cost") or 0.0)
+        days_unused = int(item.get("days_since_last_use") or 0)
+        utility = utility_score_from_days(days_unused)
+        burn = monthly_cost * (1.0 - utility)
+        total_monthly_cost += monthly_cost
+        total_phantom_burn += burn
+        row = {
+            "name": item.get("name") or "Subscription",
+            "monthly_cost": monthly_cost,
+            "days_unused": days_unused,
+            "utility": utility,
+            "burn": burn,
+        }
+        ranked.append(row)
+        if days_unused >= 45:
+            decayed_items.append(row)
+
+    ranked.sort(key=lambda x: x["burn"], reverse=True)
+    decayed_items.sort(key=lambda x: x["monthly_cost"], reverse=True)
+
+    goal = subscription_profile.get("savings_goal") or {}
+    goal_name = (goal.get("name") or "").strip() or "your savings goal"
+    goal_amount = float(goal.get("amount") or 0.0)
+    pause_3m_savings = sum(item["monthly_cost"] for item in decayed_items) * 3.0
+    weeks_earlier = None
+    if goal_amount > 0 and pause_3m_savings > 0:
+        weeks_earlier = (pause_3m_savings / goal_amount) * 12.0
+
+    lines = [
+        "Subscription Decay and Phantom Burn report:",
+        f"- Total monthly subscription cost: ${total_monthly_cost:.2f}",
+        f"- Estimated phantom burn this month (low utility spend): ${total_phantom_burn:.2f}",
+    ]
+
+    for row in ranked[:8]:
+        utility_pct = row["utility"] * 100.0
+        lines.append(
+            f"- {row['name']}: ${row['monthly_cost']:.2f}/mo | unused {row['days_unused']}d | utility {utility_pct:.0f}% | burn ${row['burn']:.2f}"
+        )
+
+    if decayed_items:
+        top = decayed_items[0]
+        alert = (
+            f"ALERT: You have paid ${top['monthly_cost']:.2f} for {top['name']} this month but have not used it in {top['days_unused']} days."
+        )
+        lines.append(alert)
+
+        if pause_3m_savings > 0:
+            if weeks_earlier is not None:
+                lines.append(
+                    f"If you pause low-usage subscriptions for 3 months, you save ${pause_3m_savings:.2f} and can hit {goal_name} about {weeks_earlier:.1f} weeks earlier."
+                )
+            else:
+                lines.append(
+                    f"If you pause low-usage subscriptions for 3 months, you save about ${pause_3m_savings:.2f}."
+                )
+    else:
+        lines.append("No major decay detected: all tracked subscriptions show recent usage.")
+
+    subscription_profile["last_alert_at"] = utc_now_iso()
+    user_state["subscription_profile"] = subscription_profile
+    return with_citations("\n".join(lines), ["User-provided subscription and usage inputs"], include_sources)
+
+
+def apply_subscription_command(user_state, user_message, include_sources=False):
+    """Apply subscription management commands and return reply/state-changed tuple."""
+    user_state = ensure_finance_profiles(user_state)
+    normalized = normalize_intent_text(user_message)
+    subscription_profile = user_state.get("subscription_profile") or {}
+    items = subscription_profile.get("items") or []
+
+    if any(x in normalized for x in ["subscription list", "list subscriptions", "my subscriptions", "show subscriptions"]):
+        if not items:
+            return "You are not tracking subscriptions yet.", False
+        rows = ["Tracked subscriptions:"]
+        for item in items:
+            rows.append(
+                f"- {item['name']}: ${float(item['monthly_cost']):.2f}/mo | unused {int(item['days_since_last_use'])}d"
+            )
+        return "\n".join(rows), False
+
+    if any(x in normalized for x in ["subscription clear", "clear subscriptions"]):
+        subscription_profile["items"] = []
+        subscription_profile["last_alert_at"] = utc_now_iso()
+        user_state["subscription_profile"] = subscription_profile
+        return "All tracked subscriptions cleared.", True
+
+    if any(x in normalized for x in ["subscription add", "add subscription"]):
+        payload = parse_subscription_add_payload(user_message)
+        if not payload:
+            return "Use format like: subscription add Netflix 15.99 45 days.", False
+        existing = None
+        for item in items:
+            if normalize_case(item.get("name")) == normalize_case(payload["name"]):
+                existing = item
+                break
+        if existing:
+            existing["monthly_cost"] = payload["monthly_cost"]
+            existing["days_since_last_use"] = payload["days_since_last_use"]
+            existing["updated_at"] = utc_now_iso()
+            action = "updated"
+        else:
+            items.append({
+                "name": payload["name"],
+                "monthly_cost": payload["monthly_cost"],
+                "days_since_last_use": payload["days_since_last_use"],
+                "updated_at": utc_now_iso(),
+            })
+            action = "added"
+        subscription_profile["items"] = items[:120]
+        subscription_profile["last_alert_at"] = utc_now_iso()
+        user_state["subscription_profile"] = subscription_profile
+        return (
+            f"Subscription {action}: {payload['name']} at ${payload['monthly_cost']:.2f}/mo, "
+            f"unused {payload['days_since_last_use']} days."
+        ), True
+
+    if any(x in normalized for x in ["subscription remove", "remove subscription"]):
+        payload = re.sub(r"subscription remove|remove subscription", " ", user_message, flags=re.IGNORECASE)
+        target = re.sub(r"\s+", " ", payload).strip()
+        if not target:
+            return "Tell me which subscription to remove.", False
+        before = len(items)
+        items = [item for item in items if normalize_case(item.get("name")) != normalize_case(target)]
+        subscription_profile["items"] = items
+        subscription_profile["last_alert_at"] = utc_now_iso()
+        user_state["subscription_profile"] = subscription_profile
+        if len(items) == before:
+            return "I could not find that subscription in your tracked list.", False
+        return f"Removed subscription: {target}.", True
+
+    if any(x in normalized for x in ["subscription usage", "update usage", "subscription used"]):
+        usage_match = re.search(r"(?:usage|used)\s+(.+?)\s+(\d+)\s*(?:d|day|days)", user_message, flags=re.IGNORECASE)
+        if not usage_match:
+            return "Use format like: subscription usage Netflix 45 days.", False
+        target_name = usage_match.group(1).strip(" ,.-")
+        days_unused = int(usage_match.group(2))
+        for item in items:
+            if normalize_case(item.get("name")) == normalize_case(target_name):
+                item["days_since_last_use"] = max(0, days_unused)
+                item["updated_at"] = utc_now_iso()
+                subscription_profile["items"] = items
+                subscription_profile["last_alert_at"] = utc_now_iso()
+                user_state["subscription_profile"] = subscription_profile
+                return f"Updated usage for {item['name']}: {days_unused} days unused.", True
+        return "Subscription not found. Add it first with cost.", False
+
+    if any(x in normalized for x in ["set goal", "savings goal", "goal amount"]):
+        amount_match = re.search(r"\$?\s*([0-9]+(?:\.[0-9]+)?)", user_message)
+        if not amount_match:
+            return "Set a goal like: set savings goal weekend trip 900.", False
+        amount = float(amount_match.group(1))
+        goal_name = re.sub(r"\$?\s*[0-9]+(?:\.[0-9]+)?", " ", user_message)
+        goal_name = re.sub(r"\b(set|savings|goal|amount|my|for)\b", " ", goal_name, flags=re.IGNORECASE)
+        goal_name = re.sub(r"\s+", " ", goal_name).strip(" ,.-") or "your savings goal"
+        subscription_profile["savings_goal"] = {"name": goal_name, "amount": max(0.0, amount)}
+        subscription_profile["last_alert_at"] = utc_now_iso()
+        user_state["subscription_profile"] = subscription_profile
+        return f"Savings goal set: {goal_name} (${amount:.2f}).", True
+
+    if any(x in normalized for x in ["phantom burn", "subscription decay", "burn alert", "subscription alert"]):
+        return build_subscription_decay_report(user_state, include_sources=include_sources), True
+
+    return "", False
+
+
+def get_personal_finance_feature_reply(user_message, user_state, include_sources=False):
+    """Handle watchlist/subscription commands before generic model responses."""
+    user_state = ensure_finance_profiles(user_state)
+    normalized = normalize_intent_text(user_message)
+
+    watchlist_reply, watchlist_changed = apply_watchlist_command(
+        user_state, user_message, include_sources=include_sources
+    )
+    if watchlist_reply:
+        return watchlist_reply, (watchlist_changed or True)
+
+    subscription_reply, subscription_changed = apply_subscription_command(
+        user_state, user_message, include_sources=include_sources
+    )
+    if subscription_reply:
+        return subscription_reply, (subscription_changed or True)
+
+    # Proactive decay alert for finance-oriented prompts.
+    if any(marker in normalized for marker in ["finance", "econom", "portfolio", "stock", "market"]):
+        alert = build_subscription_decay_report(user_state, include_sources=include_sources)
+        if alert and "No subscriptions tracked" not in alert:
+            return alert, True
+
+    return "", False
 
 
 def extract_country_from_text(normalized_text):
@@ -2773,12 +3291,23 @@ def try_internet_answer(normalized_text, original_text="", include_sources=False
     return None
 
 
-def get_local_smart_reply(user_message):
+def get_local_smart_reply(user_message, user_id=DEFAULT_USER_ID):
     """Local fallback for when API is unavailable."""
     normalized = normalize_intent_text(user_message)
     original_lower = normalize_case(user_message).strip()
     words = set(re.findall(r"[a-z']+", normalized))
     wants_citations = is_citation_request(normalized)
+
+    user_state = load_user_state(user_id)
+    finance_direct_reply, finance_changed = get_personal_finance_feature_reply(
+        user_message,
+        user_state,
+        include_sources=wants_citations,
+    )
+    if finance_direct_reply:
+        if finance_changed:
+            save_user_state(user_id, user_state)
+        return finance_direct_reply
 
     if any(marker in original_lower for marker in ["speak mongolian", "in mongolian", "mongolian please", "монголоор", "монгол хэлээр"]):
         return "Мэдээж, одооноос би Монгол хэлээр хариулна."
@@ -3913,6 +4442,201 @@ def api_finance_quotes():
         "cache_ttl_seconds": FINANCE_QUOTE_CACHE_TTL_SECONDS,
         "source": source_url or "https://finance.yahoo.com/",
         "quotes": rows,
+    })
+
+
+@app.route("/api/finance/watchlist", methods=["GET", "POST", "DELETE"])
+def api_finance_watchlist():
+    """Manage per-user stock watchlist and optionally fetch a live snapshot."""
+    mark_user_activity()
+    session_user_id = resolve_session_user_id()
+    user_id = sanitize_user_id(session_user_id or request.args.get("user_id") or DEFAULT_USER_ID)
+    user_state = ensure_finance_profiles(load_user_state(user_id))
+    finance_profile = user_state.get("finance_profile") or {}
+
+    if request.method == "GET":
+        include_quotes = parse_bool(request.args.get("include_quotes"), default=False)
+        watchlist = finance_profile.get("watchlist") or []
+        response = {
+            "user_id": user_id,
+            "watchlist": watchlist,
+            "watchlist_last_checked": finance_profile.get("watchlist_last_checked") or "",
+        }
+        if include_quotes and watchlist:
+            try:
+                quotes_map, source_url = fetch_live_quotes(watchlist)
+            except Exception:
+                return jsonify({"error": "Failed to fetch quote snapshot."}), 502
+            response["source"] = source_url or "https://finance.yahoo.com/"
+            response["quotes"] = [
+                {
+                    "symbol": symbol,
+                    "name": (quotes_map.get(symbol) or {}).get("name") or symbol,
+                    "price": (quotes_map.get(symbol) or {}).get("price"),
+                    "change_percent": (quotes_map.get(symbol) or {}).get("change_percent"),
+                    "market_time": (quotes_map.get(symbol) or {}).get("market_time"),
+                    "market_time_utc": format_quote_timestamp((quotes_map.get(symbol) or {}).get("market_time")),
+                }
+                for symbol in watchlist
+            ]
+        return jsonify(response)
+
+    if reject_large_request(8192):
+        return jsonify({"error": "Payload too large."}), 413
+    data = request.get_json(silent=True) or {}
+    symbols = data.get("symbols") or []
+    if isinstance(symbols, str):
+        symbols = re.split(r"[,\s]+", symbols)
+    if not isinstance(symbols, list):
+        return jsonify({"error": "symbols must be a list or string."}), 400
+
+    normalized = []
+    for token in symbols:
+        symbol = normalize_ticker_symbol(str(token))
+        if symbol and symbol not in normalized:
+            normalized.append(symbol)
+    normalized = normalized[:60]
+
+    watchlist = finance_profile.get("watchlist") or []
+    if request.method == "POST":
+        for symbol in normalized:
+            if symbol not in watchlist:
+                watchlist.append(symbol)
+        watchlist = watchlist[:60]
+        finance_profile["watchlist"] = watchlist
+        finance_profile["watchlist_last_checked"] = utc_now_iso()
+        user_state["finance_profile"] = finance_profile
+        save_user_state(user_id, user_state)
+        return jsonify({"status": "ok", "user_id": user_id, "watchlist": watchlist})
+
+    clear_all = parse_bool(data.get("clear"), default=False)
+    if clear_all:
+        watchlist = []
+    else:
+        watchlist = [symbol for symbol in watchlist if symbol not in set(normalized)]
+    finance_profile["watchlist"] = watchlist
+    finance_profile["watchlist_last_checked"] = utc_now_iso()
+    user_state["finance_profile"] = finance_profile
+    save_user_state(user_id, user_state)
+    return jsonify({"status": "ok", "user_id": user_id, "watchlist": watchlist})
+
+
+@app.route("/api/finance/subscriptions", methods=["GET", "POST", "DELETE"])
+def api_finance_subscriptions():
+    """Manage subscriptions used by decay/phantom-burn analysis."""
+    mark_user_activity()
+    session_user_id = resolve_session_user_id()
+    user_id = sanitize_user_id(session_user_id or request.args.get("user_id") or DEFAULT_USER_ID)
+    user_state = ensure_finance_profiles(load_user_state(user_id))
+    subscription_profile = user_state.get("subscription_profile") or {}
+
+    if request.method == "GET":
+        return jsonify({
+            "user_id": user_id,
+            "items": subscription_profile.get("items") or [],
+            "savings_goal": subscription_profile.get("savings_goal") or {"name": "", "amount": 0.0},
+            "last_alert_at": subscription_profile.get("last_alert_at") or "",
+        })
+
+    if reject_large_request(8192):
+        return jsonify({"error": "Payload too large."}), 413
+    data = request.get_json(silent=True) or {}
+
+    if request.method == "POST":
+        name = (data.get("name") or "").strip()
+        if not name:
+            return jsonify({"error": "name is required."}), 400
+        try:
+            monthly_cost = float(data.get("monthly_cost") or 0.0)
+        except Exception:
+            monthly_cost = 0.0
+        try:
+            days_unused = int(float(data.get("days_since_last_use") or 0))
+        except Exception:
+            days_unused = 0
+        if monthly_cost <= 0:
+            return jsonify({"error": "monthly_cost must be > 0."}), 400
+
+        items = subscription_profile.get("items") or []
+        target = None
+        for item in items:
+            if normalize_case(item.get("name")) == normalize_case(name):
+                target = item
+                break
+        if target:
+            target["monthly_cost"] = monthly_cost
+            target["days_since_last_use"] = max(0, days_unused)
+            target["updated_at"] = utc_now_iso()
+        else:
+            items.append({
+                "name": name,
+                "monthly_cost": monthly_cost,
+                "days_since_last_use": max(0, days_unused),
+                "updated_at": utc_now_iso(),
+            })
+        subscription_profile["items"] = items[:120]
+        user_state["subscription_profile"] = subscription_profile
+        save_user_state(user_id, user_state)
+        return jsonify({"status": "ok", "user_id": user_id, "items": subscription_profile["items"]})
+
+    clear_all = parse_bool(data.get("clear"), default=False)
+    items = subscription_profile.get("items") or []
+    if clear_all:
+        items = []
+    else:
+        name = (data.get("name") or "").strip()
+        if not name:
+            return jsonify({"error": "name is required unless clear=true."}), 400
+        items = [item for item in items if normalize_case(item.get("name")) != normalize_case(name)]
+    subscription_profile["items"] = items
+    user_state["subscription_profile"] = subscription_profile
+    save_user_state(user_id, user_state)
+    return jsonify({"status": "ok", "user_id": user_id, "items": items})
+
+
+@app.route("/api/finance/subscriptions/goal", methods=["POST"])
+def api_finance_subscriptions_goal():
+    """Set savings goal used for phantom-burn acceleration estimates."""
+    mark_user_activity()
+    if reject_large_request(4096):
+        return jsonify({"error": "Payload too large."}), 413
+    session_user_id = resolve_session_user_id()
+    data = request.get_json(silent=True) or {}
+    user_id = sanitize_user_id(session_user_id or data.get("user_id") or DEFAULT_USER_ID)
+    name = (data.get("name") or "").strip() or "your savings goal"
+    try:
+        amount = float(data.get("amount") or 0.0)
+    except Exception:
+        amount = 0.0
+    if amount <= 0:
+        return jsonify({"error": "amount must be > 0."}), 400
+
+    user_state = ensure_finance_profiles(load_user_state(user_id))
+    subscription_profile = user_state.get("subscription_profile") or {}
+    subscription_profile["savings_goal"] = {
+        "name": name,
+        "amount": amount,
+    }
+    subscription_profile["last_alert_at"] = utc_now_iso()
+    user_state["subscription_profile"] = subscription_profile
+    save_user_state(user_id, user_state)
+    return jsonify({"status": "ok", "user_id": user_id, "savings_goal": subscription_profile["savings_goal"]})
+
+
+@app.route("/api/finance/alerts", methods=["GET"])
+def api_finance_alerts():
+    """Return proactive subscription decay/phantom burn analysis text."""
+    mark_user_activity()
+    session_user_id = resolve_session_user_id()
+    user_id = sanitize_user_id(session_user_id or request.args.get("user_id") or DEFAULT_USER_ID)
+    include_sources = parse_bool(request.args.get("include_sources"), default=False)
+    user_state = ensure_finance_profiles(load_user_state(user_id))
+    report_text = build_subscription_decay_report(user_state, include_sources=include_sources)
+    save_user_state(user_id, user_state)
+    return jsonify({
+        "user_id": user_id,
+        "as_of_utc": utc_now_iso(),
+        "alert": report_text,
     })
 
 
