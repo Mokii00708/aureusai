@@ -73,6 +73,9 @@ finance_provider_health = {
 }
 FINANCE_QUOTE_CACHE_TTL_SECONDS = int(os.getenv("FINANCE_QUOTE_CACHE_TTL_SECONDS", "60"))
 FX_RATE_CACHE_TTL_SECONDS = int(os.getenv("FX_RATE_CACHE_TTL_SECONDS", "3600"))
+OPPORTUNITY_COST_THRESHOLD_USD = float(os.getenv("OPPORTUNITY_COST_THRESHOLD_USD", "100"))
+OPPORTUNITY_COST_DEFAULT_YEARS = int(os.getenv("OPPORTUNITY_COST_DEFAULT_YEARS", "10"))
+OPPORTUNITY_COST_DEFAULT_ANNUAL_RETURN = float(os.getenv("OPPORTUNITY_COST_DEFAULT_ANNUAL_RETURN", "0.07"))
 ALPHA_VANTAGE_API_KEY = (os.getenv("ALPHA_VANTAGE_API_KEY") or "").strip()
 HOME_COUNTRY = (os.getenv("HOME_COUNTRY") or "United States").strip()
 
@@ -377,6 +380,10 @@ def default_user_state():
             "last_daily_alert_date": "",
             "auto_sweep_enabled": True,
             "auto_sweep_target": "investment index",
+            "opportunity_cost_threshold_usd": OPPORTUNITY_COST_THRESHOLD_USD,
+            "opportunity_cost_default_years": OPPORTUNITY_COST_DEFAULT_YEARS,
+            "opportunity_cost_default_annual_return": OPPORTUNITY_COST_DEFAULT_ANNUAL_RETURN,
+            "last_opportunity_cost_gate": {},
         },
         "geopolitical_profile": {
             "suppliers": [],
@@ -2069,6 +2076,92 @@ def build_runway_buffer_metrics(capital_usd, current_city, base_monthly_cap_usd=
     }
 
 
+def parse_opportunity_cost_payload(text):
+    """Parse purchase intent for opportunity-cost gating (Alpha Rule)."""
+    raw = (text or "").strip()
+    lowered = normalize_case(raw)
+    if not raw:
+        return None
+
+    intent_markers = [
+        "buy", "purchase", "spend", "pay", "checkout", "get this", "cop this", "order",
+        "i want", "i'm buying", "im buying", "should i buy", "should i purchase",
+    ]
+    if not any(marker in lowered for marker in intent_markers):
+        return None
+
+    amount = None
+    amount_match = re.search(r"\$\s*([0-9][0-9,]*(?:\.[0-9]+)?)", raw)
+    if amount_match:
+        amount = to_float_or_none(amount_match.group(1))
+    if amount is None:
+        fallback_nums = [to_float_or_none(v) for v in re.findall(r"\b([0-9][0-9,]*(?:\.[0-9]+)?)\b", raw)]
+        fallback_nums = [n for n in fallback_nums if isinstance(n, (int, float)) and n > 0]
+        if fallback_nums:
+            amount = fallback_nums[0]
+
+    item = "purchase"
+    item_match = re.search(r"(?:buy|purchase|get|order)\s+(?:a|an|the)?\s*([^,.!?]+)", lowered)
+    if item_match:
+        item_text = re.sub(r"\s+for\s+\$?[0-9][0-9,]*(?:\.[0-9]+)?", "", item_match.group(1), flags=re.IGNORECASE)
+        item = re.sub(r"\s+", " ", item_text).strip(" .,!?") or item
+
+    years = OPPORTUNITY_COST_DEFAULT_YEARS
+    years_match = re.search(r"([0-9]{1,2})\s*(?:years|year|yrs|yr)\b", lowered)
+    if years_match:
+        try:
+            years = max(1, min(50, int(years_match.group(1))))
+        except Exception:
+            years = OPPORTUNITY_COST_DEFAULT_YEARS
+
+    annual_return = OPPORTUNITY_COST_DEFAULT_ANNUAL_RETURN
+    return_match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:return|roi|index|annual)?", lowered)
+    if return_match:
+        pct = to_float_or_none(return_match.group(1))
+        if pct is not None:
+            annual_return = max(0.0, min(1.0, float(pct) / 100.0))
+
+    essential_terms = {
+        "rent", "mortgage", "medicine", "medical", "hospital", "insurance", "tuition", "debt", "loan", "groceries", "grocery", "utility", "utilities", "electricity", "water", "internet bill", "tax", "fuel", "gas",
+    }
+    non_essential_terms = {
+        "luxury", "designer", "watch", "bag", "shoes", "sneakers", "iphone", "phone", "laptop", "vacation", "trip", "holiday", "jewelry", "gaming", "console", "perfume", "cosmetic", "subscription",
+    }
+    is_essential = any(term in lowered for term in essential_terms)
+    is_non_essential = any(term in lowered for term in non_essential_terms) or not is_essential
+
+    return {
+        "amount_usd": float(amount or 0.0),
+        "item": item,
+        "years": years,
+        "annual_return": annual_return,
+        "is_non_essential": is_non_essential,
+        "raw_text": raw,
+    }
+
+
+def build_opportunity_cost_gate(amount_usd, years=OPPORTUNITY_COST_DEFAULT_YEARS, annual_return=OPPORTUNITY_COST_DEFAULT_ANNUAL_RETURN):
+    """Compute future value and opportunity cost for a one-time expense."""
+    amount = float(amount_usd or 0.0)
+    if amount <= 0:
+        raise ValueError("amount_usd must be greater than zero.")
+    horizon_years = int(max(1, min(50, int(years or OPPORTUNITY_COST_DEFAULT_YEARS))))
+    rate = float(annual_return if annual_return is not None else OPPORTUNITY_COST_DEFAULT_ANNUAL_RETURN)
+    rate = max(0.0, min(1.0, rate))
+
+    future_value = amount * ((1.0 + rate) ** horizon_years)
+    opportunity_cost = max(0.0, future_value - amount)
+    return {
+        "as_of_utc": utc_now_iso(),
+        "amount_usd": amount,
+        "years": horizon_years,
+        "annual_return": rate,
+        "future_value_usd": future_value,
+        "opportunity_cost_usd": opportunity_cost,
+        "formula": "FV = PV * (1 + r)^n",
+    }
+
+
 def mark_quote_provider_attempt(provider):
     """Update provider health metrics for an attempt."""
     with finance_cache_lock:
@@ -2731,10 +2824,28 @@ def ensure_finance_profiles(user_state):
     behavior_profile.setdefault("spend_events", [])
     behavior_profile.setdefault("last_coach_alert_at", "")
     behavior_profile.setdefault("last_daily_alert_date", "")
+    behavior_profile.setdefault("opportunity_cost_threshold_usd", OPPORTUNITY_COST_THRESHOLD_USD)
+    behavior_profile.setdefault("opportunity_cost_default_years", OPPORTUNITY_COST_DEFAULT_YEARS)
+    behavior_profile.setdefault("opportunity_cost_default_annual_return", OPPORTUNITY_COST_DEFAULT_ANNUAL_RETURN)
+    behavior_profile.setdefault("last_opportunity_cost_gate", {})
     if not isinstance(behavior_profile.get("auto_sweep_enabled"), bool):
         behavior_profile["auto_sweep_enabled"] = True
     auto_sweep_target = (behavior_profile.get("auto_sweep_target") or "").strip()
     behavior_profile["auto_sweep_target"] = auto_sweep_target or "investment index"
+    try:
+        behavior_profile["opportunity_cost_threshold_usd"] = max(0.0, float(behavior_profile.get("opportunity_cost_threshold_usd") or OPPORTUNITY_COST_THRESHOLD_USD))
+    except Exception:
+        behavior_profile["opportunity_cost_threshold_usd"] = OPPORTUNITY_COST_THRESHOLD_USD
+    try:
+        behavior_profile["opportunity_cost_default_years"] = max(1, min(50, int(float(behavior_profile.get("opportunity_cost_default_years") or OPPORTUNITY_COST_DEFAULT_YEARS))))
+    except Exception:
+        behavior_profile["opportunity_cost_default_years"] = OPPORTUNITY_COST_DEFAULT_YEARS
+    try:
+        behavior_profile["opportunity_cost_default_annual_return"] = max(0.0, min(1.0, float(behavior_profile.get("opportunity_cost_default_annual_return") or OPPORTUNITY_COST_DEFAULT_ANNUAL_RETURN)))
+    except Exception:
+        behavior_profile["opportunity_cost_default_annual_return"] = OPPORTUNITY_COST_DEFAULT_ANNUAL_RETURN
+    if not isinstance(behavior_profile.get("last_opportunity_cost_gate"), dict):
+        behavior_profile["last_opportunity_cost_gate"] = {}
 
     cleaned_events = []
     for item in behavior_profile.get("spend_events") or []:
@@ -4036,6 +4147,10 @@ def linguistic_engine_parse_intent(user_message):
         payload = parse_runway_buffer_payload(user_message)
         return {"action": "runway_buffer", "payload": payload}
 
+    alpha_payload = parse_opportunity_cost_payload(user_message)
+    if alpha_payload and alpha_payload.get("amount_usd", 0.0) > 0:
+        return {"action": "opportunity_cost_gate", "payload": alpha_payload}
+
     if any(x in normalized for x in ["auto sweep on", "enable auto sweep"]):
         return {"action": "auto_sweep_on"}
 
@@ -4319,6 +4434,68 @@ def analytical_engine_execute(user_id, user_state, intent):
             "text": text,
             "source": metrics.get("fx_source") or "https://open.er-api.com/",
             "runway_buffer": metrics,
+        }
+
+    if action == "opportunity_cost_gate":
+        payload = intent.get("payload") or {}
+        threshold = float(behavior_profile.get("opportunity_cost_threshold_usd") or OPPORTUNITY_COST_THRESHOLD_USD)
+        default_years = int(behavior_profile.get("opportunity_cost_default_years") or OPPORTUNITY_COST_DEFAULT_YEARS)
+        default_return = float(behavior_profile.get("opportunity_cost_default_annual_return") or OPPORTUNITY_COST_DEFAULT_ANNUAL_RETURN)
+
+        amount_usd = float(payload.get("amount_usd") or 0.0)
+        if amount_usd <= 0:
+            return {
+                "ok": True,
+                "action": action,
+                "state_changed": False,
+                "text": "Share the purchase amount and I will run the Alpha Rule gate, for example: buy sneakers for $200.",
+            }
+
+        if not bool(payload.get("is_non_essential", True)):
+            return {
+                "ok": True,
+                "action": action,
+                "state_changed": False,
+                "text": "That looks like an essential expense, so I will not block it with the Alpha Rule gate.",
+            }
+
+        years = int(payload.get("years") or default_years)
+        annual_return = float(payload.get("annual_return") if payload.get("annual_return") is not None else default_return)
+        gate = build_opportunity_cost_gate(amount_usd=amount_usd, years=years, annual_return=annual_return)
+        item = (payload.get("item") or "purchase").strip() or "purchase"
+        rate_pct = gate["annual_return"] * 100.0
+
+        behavior_profile["last_opportunity_cost_gate"] = {
+            "item": item,
+            "amount_usd": amount_usd,
+            "threshold_usd": threshold,
+            "years": gate["years"],
+            "annual_return": gate["annual_return"],
+            "future_value_usd": gate["future_value_usd"],
+            "opportunity_cost_usd": gate["opportunity_cost_usd"],
+            "created_at": utc_now_iso(),
+        }
+        user_state["behavior_budget_profile"] = behavior_profile
+
+        if amount_usd < threshold:
+            text = (
+                f"Alpha Rule note: this {item} purchase is ${amount_usd:.2f}, below your gating threshold of ${threshold:.2f}. "
+                f"At {rate_pct:.1f}% for {gate['years']} years, it still compounds to ${gate['future_value_usd']:.2f}."
+            )
+            return {"ok": True, "action": action, "state_changed": True, "text": text}
+
+        text = (
+            f"Alpha Rule reality check: This ${amount_usd:.2f} {item} purchase can cost about "
+            f"${gate['future_value_usd']:.2f} over {gate['years']} years at {rate_pct:.1f}% annual return "
+            f"(${gate['opportunity_cost_usd']:.2f} in opportunity cost). Do you still want to execute?"
+        )
+        return {
+            "ok": True,
+            "action": action,
+            "state_changed": True,
+            "text": text,
+            "source": "https://www.investor.gov/financial-tools-calculators/calculators/compound-interest-calculator",
+            "opportunity_cost": gate,
         }
 
     if action == "auto_sweep_on":
@@ -6714,6 +6891,63 @@ def api_finance_runway_buffer():
         "user_id": user_id,
         "runway_buffer": metrics,
         "saved_profile": finance_profile.get("runway_buffer_profile") or {},
+    })
+
+
+@app.route("/api/finance/opportunity-cost", methods=["GET", "POST"])
+def api_finance_opportunity_cost():
+    """Compute or configure opportunity-cost gating (Alpha Rule)."""
+    mark_user_activity()
+    session_user_id = resolve_session_user_id()
+    user_id = sanitize_user_id(session_user_id or request.args.get("user_id") or DEFAULT_USER_ID)
+    user_state = ensure_finance_profiles(load_user_state(user_id))
+    behavior_profile = user_state.get("behavior_budget_profile") or {}
+
+    if request.method == "GET":
+        amount_usd = to_float_or_none(request.args.get("amount_usd"))
+        years = int(to_float_or_none(request.args.get("years")) or behavior_profile.get("opportunity_cost_default_years") or OPPORTUNITY_COST_DEFAULT_YEARS)
+        annual_return = to_float_or_none(request.args.get("annual_return"))
+        if annual_return is None:
+            annual_return = float(behavior_profile.get("opportunity_cost_default_annual_return") or OPPORTUNITY_COST_DEFAULT_ANNUAL_RETURN)
+        threshold = float(behavior_profile.get("opportunity_cost_threshold_usd") or OPPORTUNITY_COST_THRESHOLD_USD)
+
+        if amount_usd is None or float(amount_usd) <= 0:
+            return jsonify({"error": "amount_usd must be greater than zero."}), 400
+
+        gate = build_opportunity_cost_gate(float(amount_usd), years=years, annual_return=float(annual_return))
+        return jsonify({
+            "user_id": user_id,
+            "threshold_usd": threshold,
+            "opportunity_cost": gate,
+        })
+
+    if reject_large_request(8192):
+        return jsonify({"error": "Payload too large."}), 413
+    data = request.get_json(silent=True) or {}
+
+    threshold = to_float_or_none(data.get("threshold_usd"))
+    years = to_float_or_none(data.get("default_years"))
+    annual_return = to_float_or_none(data.get("default_annual_return"))
+
+    if threshold is not None:
+        behavior_profile["opportunity_cost_threshold_usd"] = max(0.0, float(threshold))
+    if years is not None:
+        behavior_profile["opportunity_cost_default_years"] = max(1, min(50, int(float(years))))
+    if annual_return is not None:
+        behavior_profile["opportunity_cost_default_annual_return"] = max(0.0, min(1.0, float(annual_return)))
+
+    user_state["behavior_budget_profile"] = behavior_profile
+    save_user_state(user_id, user_state)
+
+    return jsonify({
+        "status": "ok",
+        "user_id": user_id,
+        "settings": {
+            "threshold_usd": float(behavior_profile.get("opportunity_cost_threshold_usd") or OPPORTUNITY_COST_THRESHOLD_USD),
+            "default_years": int(behavior_profile.get("opportunity_cost_default_years") or OPPORTUNITY_COST_DEFAULT_YEARS),
+            "default_annual_return": float(behavior_profile.get("opportunity_cost_default_annual_return") or OPPORTUNITY_COST_DEFAULT_ANNUAL_RETURN),
+        },
+        "last_gate": behavior_profile.get("last_opportunity_cost_gate") or {},
     })
 
 
