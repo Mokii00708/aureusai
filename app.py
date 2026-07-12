@@ -65,14 +65,37 @@ auth_rate_limit_hits = {}
 analytics_db_lock = threading.Lock()
 finance_cache_lock = threading.Lock()
 finance_quote_cache = {}
+fx_rate_cache = {}
 finance_provider_health = {
     "yahoo": {"last_attempt": "", "last_success": "", "last_error": "", "success_count": 0, "error_count": 0},
     "stooq": {"last_attempt": "", "last_success": "", "last_error": "", "success_count": 0, "error_count": 0},
     "alpha_vantage": {"last_attempt": "", "last_success": "", "last_error": "", "success_count": 0, "error_count": 0},
 }
 FINANCE_QUOTE_CACHE_TTL_SECONDS = int(os.getenv("FINANCE_QUOTE_CACHE_TTL_SECONDS", "60"))
+FX_RATE_CACHE_TTL_SECONDS = int(os.getenv("FX_RATE_CACHE_TTL_SECONDS", "3600"))
 ALPHA_VANTAGE_API_KEY = (os.getenv("ALPHA_VANTAGE_API_KEY") or "").strip()
 HOME_COUNTRY = (os.getenv("HOME_COUNTRY") or "United States").strip()
+
+BASELINE_COST_INDEX_CITY = "new york"
+CITY_COST_INDEX = {
+    "new york": {"currency": "USD", "cost_index": 100.0},
+    "silicon valley": {"currency": "USD", "cost_index": 185.0},
+    "san francisco": {"currency": "USD", "cost_index": 185.0},
+    "london": {"currency": "GBP", "cost_index": 165.0},
+    "dubai": {"currency": "AED", "cost_index": 120.0},
+    "abu dhabi": {"currency": "AED", "cost_index": 118.0},
+    "mumbai": {"currency": "INR", "cost_index": 55.0},
+    "bengaluru": {"currency": "INR", "cost_index": 60.0},
+    "bangalore": {"currency": "INR", "cost_index": 60.0},
+    "delhi": {"currency": "INR", "cost_index": 52.0},
+    "berlin": {"currency": "EUR", "cost_index": 95.0},
+    "paris": {"currency": "EUR", "cost_index": 110.0},
+    "madrid": {"currency": "EUR", "cost_index": 82.0},
+    "lisbon": {"currency": "EUR", "cost_index": 78.0},
+    "amsterdam": {"currency": "EUR", "cost_index": 112.0},
+    "singapore": {"currency": "SGD", "cost_index": 145.0},
+    "tokyo": {"currency": "JPY", "cost_index": 115.0},
+}
 
 GEOPOLITICAL_EVENT_KEYWORDS = {
     "tariff": ["tariff", "duties", "import duty", "trade barrier"],
@@ -332,6 +355,13 @@ def default_user_state():
             "watchlist": [],
             "watchlist_last_checked": "",
             "watchlist_last_snapshot": [],
+            "runway_buffer_profile": {
+                "base_city": BASELINE_COST_INDEX_CITY,
+                "current_city": "",
+                "capital_usd": 0.0,
+                "base_monthly_cap_usd": 0.0,
+                "updated_at": "",
+            },
         },
         "subscription_profile": {
             "items": [],
@@ -1870,6 +1900,175 @@ def to_float_or_none(value):
         return None
 
 
+def normalize_city_key(text):
+    """Normalize city string for lookup in PPP/cost index maps."""
+    city = normalize_case(text or "")
+    city = re.sub(r"[^a-z\s]", " ", city)
+    city = re.sub(r"\s+", " ", city).strip()
+    return city
+
+
+def detect_city_from_text(text):
+    """Best-effort city extraction from free-form user text."""
+    lowered = normalize_case(text or "")
+    candidates = sorted(CITY_COST_INDEX.keys(), key=len, reverse=True)
+    for city in candidates:
+        if re.search(rf"\b{re.escape(city)}\b", lowered):
+            return city
+    return ""
+
+
+def fetch_fx_rates(base_currency="USD"):
+    """Fetch FX rates with cache; fallback to a secondary public endpoint."""
+    base = (base_currency or "USD").upper().strip()
+    now_ts = time.time()
+    with finance_cache_lock:
+        bucket = fx_rate_cache.get(base)
+        if bucket and now_ts - float(bucket.get("cached_at") or 0.0) <= FX_RATE_CACHE_TTL_SECONDS:
+            return bucket.get("rates") or {}, bucket.get("source") or "", bucket.get("as_of_utc") or ""
+
+    rates = {}
+    source = ""
+    as_of_utc = ""
+    primary_url = f"https://open.er-api.com/v6/latest/{quote_plus(base)}"
+    try:
+        payload = fetch_json_url(primary_url)
+        if str(payload.get("result") or "").lower() == "success":
+            rates = payload.get("rates") or {}
+            source = primary_url
+            if payload.get("time_last_update_unix"):
+                try:
+                    ts = int(payload.get("time_last_update_unix"))
+                    as_of_utc = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+                except Exception:
+                    as_of_utc = ""
+    except Exception:
+        rates = {}
+
+    if not rates:
+        fallback_url = f"https://api.exchangerate.host/latest?base={quote_plus(base)}"
+        payload = fetch_json_url(fallback_url)
+        rates = payload.get("rates") or {}
+        source = fallback_url
+        as_of_utc = payload.get("date") or ""
+
+    with finance_cache_lock:
+        fx_rate_cache[base] = {
+            "cached_at": now_ts,
+            "rates": rates,
+            "source": source,
+            "as_of_utc": as_of_utc,
+        }
+    return rates, source, as_of_utc
+
+
+def parse_runway_buffer_payload(text):
+    """Parse runway-buffer request fields from natural language."""
+    raw = text or ""
+    lowered = normalize_case(raw)
+    city = detect_city_from_text(raw)
+    base_city = BASELINE_COST_INDEX_CITY
+    if "base city" in lowered or "compared to" in lowered:
+        m = re.search(r"(?:base city|compared to)\s+([a-z\s]+)", lowered)
+        if m:
+            maybe = detect_city_from_text(m.group(1))
+            if maybe:
+                base_city = maybe
+
+    capital_usd = None
+    base_monthly_cap_usd = None
+    months = None
+
+    m_capital = re.search(r"(?:capital|runway|savings|cash|lump\s*sum)\s*(?:of|=|:)?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)", lowered)
+    if m_capital:
+        capital_usd = to_float_or_none(m_capital.group(1))
+
+    m_budget = re.search(r"(?:monthly(?:\s+discretionary)?(?:\s+spending)?(?:\s+cap|\s+budget)?|budget|cap)\s*(?:of|=|:)?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)", lowered)
+    if m_budget:
+        base_monthly_cap_usd = to_float_or_none(m_budget.group(1))
+
+    m_months = re.search(r"([0-9]{1,3})\s*(?:months|month|mos|mo)\b", lowered)
+    if m_months:
+        try:
+            months = max(1, int(m_months.group(1)))
+        except Exception:
+            months = None
+
+    if capital_usd is None:
+        nums = [to_float_or_none(v) for v in re.findall(r"\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)", lowered)]
+        nums = [n for n in nums if isinstance(n, (int, float)) and n > 0]
+        if nums:
+            capital_usd = nums[0]
+            if base_monthly_cap_usd is None and len(nums) >= 2:
+                base_monthly_cap_usd = nums[1]
+
+    return {
+        "city": city,
+        "base_city": base_city,
+        "capital_usd": float(capital_usd or 0.0),
+        "base_monthly_cap_usd": float(base_monthly_cap_usd or 0.0),
+        "months": months,
+    }
+
+
+def build_runway_buffer_metrics(capital_usd, current_city, base_monthly_cap_usd=0.0, base_city=BASELINE_COST_INDEX_CITY):
+    """Compute PPP-adjusted runway and discretionary cap using live FX rates."""
+    city_key = normalize_city_key(current_city)
+    base_city_key = normalize_city_key(base_city) or BASELINE_COST_INDEX_CITY
+    current_cfg = CITY_COST_INDEX.get(city_key)
+    base_cfg = CITY_COST_INDEX.get(base_city_key)
+    if not current_cfg:
+        raise ValueError("Unsupported city for runway buffer. Add it to the cost-index map.")
+    if not base_cfg:
+        base_cfg = CITY_COST_INDEX[BASELINE_COST_INDEX_CITY]
+
+    capital_usd = float(capital_usd or 0.0)
+    if capital_usd <= 0:
+        raise ValueError("capital_usd must be greater than zero.")
+
+    base_index = float(base_cfg.get("cost_index") or 100.0)
+    local_index = float(current_cfg.get("cost_index") or 100.0)
+    if base_monthly_cap_usd and float(base_monthly_cap_usd) > 0:
+        baseline_monthly = float(base_monthly_cap_usd)
+    else:
+        baseline_monthly = max(100.0, capital_usd / 12.0)
+
+    ppp_multiplier = base_index / local_index if local_index > 0 else 1.0
+    ppp_monthly_cap_usd = baseline_monthly * ppp_multiplier
+
+    target_currency = (current_cfg.get("currency") or "USD").upper()
+    rates, fx_source, fx_as_of = fetch_fx_rates("USD")
+    fx_rate = to_float_or_none((rates or {}).get(target_currency))
+    if target_currency == "USD":
+        fx_rate = 1.0
+    if fx_rate is None or fx_rate <= 0:
+        raise ValueError(f"FX rate unavailable for {target_currency}.")
+
+    ppp_monthly_cap_local = ppp_monthly_cap_usd * fx_rate
+    runway_months_nominal = (capital_usd / baseline_monthly) if baseline_monthly > 0 else 0.0
+    runway_months_ppp = (capital_usd / ppp_monthly_cap_usd) if ppp_monthly_cap_usd > 0 else 0.0
+
+    return {
+        "as_of_utc": utc_now_iso(),
+        "base_city": base_city_key,
+        "current_city": city_key,
+        "base_currency": "USD",
+        "target_currency": target_currency,
+        "capital_usd": capital_usd,
+        "base_monthly_cap_usd": baseline_monthly,
+        "ppp_adjusted_monthly_cap_usd": ppp_monthly_cap_usd,
+        "ppp_adjusted_monthly_cap_local": ppp_monthly_cap_local,
+        "cost_index_base": base_index,
+        "cost_index_local": local_index,
+        "ppp_multiplier": ppp_multiplier,
+        "fx_rate_usd_to_target": fx_rate,
+        "fx_source": fx_source,
+        "fx_as_of_utc": fx_as_of,
+        "runway_months_nominal": runway_months_nominal,
+        "runway_months_ppp_adjusted": runway_months_ppp,
+    }
+
+
 def mark_quote_provider_attempt(provider):
     """Update provider health metrics for an attempt."""
     with finance_cache_lock:
@@ -2458,6 +2657,16 @@ def ensure_finance_profiles(user_state):
     finance_profile.setdefault("watchlist", [])
     finance_profile.setdefault("watchlist_last_checked", "")
     finance_profile.setdefault("watchlist_last_snapshot", [])
+    finance_profile.setdefault(
+        "runway_buffer_profile",
+        {
+            "base_city": BASELINE_COST_INDEX_CITY,
+            "current_city": "",
+            "capital_usd": 0.0,
+            "base_monthly_cap_usd": 0.0,
+            "updated_at": "",
+        },
+    )
 
     # Normalize watchlist symbols.
     normalized_watchlist = []
@@ -2466,6 +2675,14 @@ def ensure_finance_profiles(user_state):
         if normalized and normalized not in normalized_watchlist:
             normalized_watchlist.append(normalized)
     finance_profile["watchlist"] = normalized_watchlist[:60]
+    runway_profile = finance_profile.get("runway_buffer_profile") or {}
+    finance_profile["runway_buffer_profile"] = {
+        "base_city": normalize_city_key(runway_profile.get("base_city") or BASELINE_COST_INDEX_CITY) or BASELINE_COST_INDEX_CITY,
+        "current_city": normalize_city_key(runway_profile.get("current_city") or ""),
+        "capital_usd": max(0.0, float(to_float_or_none(runway_profile.get("capital_usd")) or 0.0)),
+        "base_monthly_cap_usd": max(0.0, float(to_float_or_none(runway_profile.get("base_monthly_cap_usd")) or 0.0)),
+        "updated_at": runway_profile.get("updated_at") or "",
+    }
 
     subscription_profile = user_state.get("subscription_profile")
     if not isinstance(subscription_profile, dict):
@@ -3813,6 +4030,12 @@ def linguistic_engine_parse_intent(user_message):
     if any(x in normalized for x in ["coach nudge", "budget nudge", "financial coach", "coach me"]):
         return {"action": "behavior_nudge"}
 
+    if any(x in normalized for x in ["runway buffer", "purchasing power parity", "ppp runway", "ppp", "multi currency runway"]) and any(
+        x in normalized for x in ["runway", "buffer", "cap", "budget", "city", "currency", "ppp", "purchasing"]
+    ):
+        payload = parse_runway_buffer_payload(user_message)
+        return {"action": "runway_buffer", "payload": payload}
+
     if any(x in normalized for x in ["auto sweep on", "enable auto sweep"]):
         return {"action": "auto_sweep_on"}
 
@@ -4034,6 +4257,69 @@ def analytical_engine_execute(user_id, user_state, intent):
             user_state["behavior_budget_profile"] = behavior_profile
             return {"ok": True, "action": action, "state_changed": True, "text": nudge}
         return {"ok": True, "action": action, "state_changed": False, "text": "No urgent trigger window detected right now. I can still help with a low-spend alternative plan."}
+
+    if action == "runway_buffer":
+        payload = intent.get("payload") or {}
+        finance_profile = user_state.get("finance_profile") or {}
+        profile = finance_profile.get("runway_buffer_profile") or {}
+
+        capital_usd = float(payload.get("capital_usd") or profile.get("capital_usd") or 0.0)
+        city = (payload.get("city") or profile.get("current_city") or "").strip()
+        base_city = (payload.get("base_city") or profile.get("base_city") or BASELINE_COST_INDEX_CITY).strip()
+        monthly_cap = float(payload.get("base_monthly_cap_usd") or profile.get("base_monthly_cap_usd") or 0.0)
+
+        if not city:
+            return {
+                "ok": True,
+                "action": action,
+                "state_changed": False,
+                "text": "Tell me your destination city (for example: London, Dubai, Mumbai) so I can compute your PPP-adjusted runway.",
+            }
+        if capital_usd <= 0:
+            return {
+                "ok": True,
+                "action": action,
+                "state_changed": False,
+                "text": "Include your available capital in USD, for example: runway buffer in London with capital 120000 and monthly budget 4000.",
+            }
+
+        try:
+            metrics = build_runway_buffer_metrics(
+                capital_usd=capital_usd,
+                current_city=city,
+                base_monthly_cap_usd=monthly_cap,
+                base_city=base_city,
+            )
+        except Exception as e:
+            return {"ok": True, "action": action, "state_changed": False, "text": f"Runway buffer calculation failed: {str(e)}"}
+
+        finance_profile["runway_buffer_profile"] = {
+            "base_city": metrics.get("base_city") or base_city,
+            "current_city": metrics.get("current_city") or city,
+            "capital_usd": metrics.get("capital_usd") or capital_usd,
+            "base_monthly_cap_usd": metrics.get("base_monthly_cap_usd") or monthly_cap,
+            "updated_at": utc_now_iso(),
+        }
+        user_state["finance_profile"] = finance_profile
+
+        text = (
+            "Multi-currency Runway Buffer:\n"
+            f"- City rotation target: {metrics['current_city'].title()} ({metrics['target_currency']})\n"
+            f"- Capital pool: ${metrics['capital_usd']:.2f} USD\n"
+            f"- Baseline monthly cap ({metrics['base_city'].title()}): ${metrics['base_monthly_cap_usd']:.2f} USD\n"
+            f"- PPP-adjusted monthly cap: ${metrics['ppp_adjusted_monthly_cap_usd']:.2f} USD ({metrics['ppp_adjusted_monthly_cap_local']:.2f} {metrics['target_currency']})\n"
+            f"- Runway (nominal): {metrics['runway_months_nominal']:.1f} months\n"
+            f"- Runway (PPP-adjusted): {metrics['runway_months_ppp_adjusted']:.1f} months\n"
+            f"- FX USD->{metrics['target_currency']}: {metrics['fx_rate_usd_to_target']:.6f}"
+        )
+        return {
+            "ok": True,
+            "action": action,
+            "state_changed": True,
+            "text": text,
+            "source": metrics.get("fx_source") or "https://open.er-api.com/",
+            "runway_buffer": metrics,
+        }
 
     if action == "auto_sweep_on":
         behavior_profile["auto_sweep_enabled"] = True
@@ -6291,22 +6577,6 @@ def api_finance_watchlist():
             ]
         return jsonify(response)
 
-
-@app.route("/api/finance/providers/health", methods=["GET"])
-def api_finance_provider_health():
-    """Return quote provider health diagnostics and cache stats."""
-    mark_user_activity()
-    with finance_cache_lock:
-        health = json.loads(json.dumps(finance_provider_health))
-        cache_size = len(finance_quote_cache)
-    return jsonify({
-        "as_of_utc": utc_now_iso(),
-        "cache_ttl_seconds": FINANCE_QUOTE_CACHE_TTL_SECONDS,
-        "cache_size": cache_size,
-        "alpha_vantage_configured": bool(ALPHA_VANTAGE_API_KEY),
-        "providers": health,
-    })
-
     if reject_large_request(8192):
         return jsonify({"error": "Payload too large."}), 413
     data = request.get_json(silent=True) or {}
@@ -6345,6 +6615,106 @@ def api_finance_provider_health():
     user_state["finance_profile"] = finance_profile
     save_user_state(user_id, user_state)
     return jsonify({"status": "ok", "user_id": user_id, "watchlist": watchlist})
+
+
+@app.route("/api/finance/providers/health", methods=["GET"])
+def api_finance_provider_health():
+    """Return quote provider health diagnostics and cache stats."""
+    mark_user_activity()
+    with finance_cache_lock:
+        health = json.loads(json.dumps(finance_provider_health))
+        cache_size = len(finance_quote_cache)
+    return jsonify({
+        "as_of_utc": utc_now_iso(),
+        "cache_ttl_seconds": FINANCE_QUOTE_CACHE_TTL_SECONDS,
+        "cache_size": cache_size,
+        "alpha_vantage_configured": bool(ALPHA_VANTAGE_API_KEY),
+        "providers": health,
+    })
+
+
+@app.route("/api/finance/runway-buffer", methods=["GET", "POST"])
+def api_finance_runway_buffer():
+    """Calculate or update multi-currency PPP-adjusted runway buffer metrics."""
+    mark_user_activity()
+    session_user_id = resolve_session_user_id()
+    user_id = sanitize_user_id(session_user_id or request.args.get("user_id") or DEFAULT_USER_ID)
+    user_state = ensure_finance_profiles(load_user_state(user_id))
+    finance_profile = user_state.get("finance_profile") or {}
+    saved_profile = finance_profile.get("runway_buffer_profile") or {}
+
+    if request.method == "GET":
+        city = normalize_city_key(request.args.get("city") or saved_profile.get("current_city") or "")
+        base_city = normalize_city_key(request.args.get("base_city") or saved_profile.get("base_city") or BASELINE_COST_INDEX_CITY)
+        capital_usd = to_float_or_none(request.args.get("capital_usd"))
+        if capital_usd is None:
+            capital_usd = float(saved_profile.get("capital_usd") or 0.0)
+        base_monthly_cap_usd = to_float_or_none(request.args.get("base_monthly_cap_usd"))
+        if base_monthly_cap_usd is None:
+            base_monthly_cap_usd = float(saved_profile.get("base_monthly_cap_usd") or 0.0)
+
+        if not city:
+            return jsonify({
+                "error": "city is required (query param) or must exist in saved runway profile.",
+                "supported_cities": sorted(CITY_COST_INDEX.keys()),
+            }), 400
+        if float(capital_usd or 0.0) <= 0:
+            return jsonify({"error": "capital_usd must be greater than zero."}), 400
+
+        try:
+            metrics = build_runway_buffer_metrics(
+                capital_usd=float(capital_usd),
+                current_city=city,
+                base_monthly_cap_usd=float(base_monthly_cap_usd or 0.0),
+                base_city=base_city,
+            )
+        except Exception as e:
+            return jsonify({"error": str(e), "supported_cities": sorted(CITY_COST_INDEX.keys())}), 400
+
+        return jsonify({
+            "user_id": user_id,
+            "runway_buffer": metrics,
+            "supported_cities": sorted(CITY_COST_INDEX.keys()),
+        })
+
+    if reject_large_request(8192):
+        return jsonify({"error": "Payload too large."}), 413
+    data = request.get_json(silent=True) or {}
+    city = normalize_city_key(data.get("city") or saved_profile.get("current_city") or "")
+    base_city = normalize_city_key(data.get("base_city") or saved_profile.get("base_city") or BASELINE_COST_INDEX_CITY)
+    capital_usd = float(to_float_or_none(data.get("capital_usd")) or saved_profile.get("capital_usd") or 0.0)
+    base_monthly_cap_usd = float(to_float_or_none(data.get("base_monthly_cap_usd")) or saved_profile.get("base_monthly_cap_usd") or 0.0)
+
+    if not city:
+        return jsonify({"error": "city is required.", "supported_cities": sorted(CITY_COST_INDEX.keys())}), 400
+    if capital_usd <= 0:
+        return jsonify({"error": "capital_usd must be greater than zero."}), 400
+
+    try:
+        metrics = build_runway_buffer_metrics(
+            capital_usd=capital_usd,
+            current_city=city,
+            base_monthly_cap_usd=base_monthly_cap_usd,
+            base_city=base_city,
+        )
+    except Exception as e:
+        return jsonify({"error": str(e), "supported_cities": sorted(CITY_COST_INDEX.keys())}), 400
+
+    finance_profile["runway_buffer_profile"] = {
+        "base_city": metrics.get("base_city") or base_city,
+        "current_city": metrics.get("current_city") or city,
+        "capital_usd": metrics.get("capital_usd") or capital_usd,
+        "base_monthly_cap_usd": metrics.get("base_monthly_cap_usd") or base_monthly_cap_usd,
+        "updated_at": utc_now_iso(),
+    }
+    user_state["finance_profile"] = finance_profile
+    save_user_state(user_id, user_state)
+    return jsonify({
+        "status": "ok",
+        "user_id": user_id,
+        "runway_buffer": metrics,
+        "saved_profile": finance_profile.get("runway_buffer_profile") or {},
+    })
 
 
 @app.route("/api/finance/subscriptions", methods=["GET", "POST", "DELETE"])
