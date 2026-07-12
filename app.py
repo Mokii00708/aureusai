@@ -66,6 +66,7 @@ analytics_db_lock = threading.Lock()
 finance_cache_lock = threading.Lock()
 finance_quote_cache = {}
 FINANCE_QUOTE_CACHE_TTL_SECONDS = int(os.getenv("FINANCE_QUOTE_CACHE_TTL_SECONDS", "60"))
+ALPHA_VANTAGE_API_KEY = (os.getenv("ALPHA_VANTAGE_API_KEY") or "").strip()
 HOME_COUNTRY = (os.getenv("HOME_COUNTRY") or "United States").strip()
 
 GEOPOLITICAL_EVENT_KEYWORDS = {
@@ -1846,8 +1847,154 @@ def parse_company_name_candidates(text):
     return names
 
 
+def to_float_or_none(value):
+    """Best-effort numeric conversion."""
+    try:
+        if value is None:
+            return None
+        return float(str(value).replace(",", "").strip())
+    except Exception:
+        return None
+
+
+def fetch_yahoo_quotes(symbols):
+    """Primary provider: Yahoo Finance quote API."""
+    if not symbols:
+        return {}, ""
+    joined = ",".join(symbols)
+    source_url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={quote_plus(joined)}"
+    payload = fetch_json_url(source_url)
+    fetched = ((payload.get("quoteResponse") or {}).get("result") or [])
+
+    quotes = {}
+    for item in fetched:
+        symbol = normalize_ticker_symbol(item.get("symbol") or "")
+        if not symbol:
+            continue
+        quotes[symbol] = {
+            "symbol": symbol,
+            "name": item.get("longName") or item.get("shortName") or symbol,
+            "price": item.get("regularMarketPrice"),
+            "currency": item.get("currency") or "USD",
+            "exchange": item.get("fullExchangeName") or item.get("exchange") or "",
+            "change_percent": item.get("regularMarketChangePercent"),
+            "market_time": item.get("regularMarketTime"),
+            "beta": item.get("beta"),
+            "market_cap": item.get("marketCap"),
+            "provider": "yahoo",
+        }
+    return quotes, source_url
+
+
+def symbol_to_stooq(symbol):
+    """Map ticker to Stooq format (best effort)."""
+    s = normalize_ticker_symbol(symbol)
+    if not s:
+        return ""
+    return f"{s.lower().replace('.', '-')}.us"
+
+
+def fetch_stooq_quotes(symbols):
+    """Secondary provider: Stooq CSV quote endpoint."""
+    if not symbols:
+        return {}, ""
+    mapping = {symbol_to_stooq(s): normalize_ticker_symbol(s) for s in symbols}
+    stooq_symbols = [k for k in mapping.keys() if k]
+    if not stooq_symbols:
+        return {}, ""
+
+    url = f"https://stooq.com/q/l/?s={','.join(stooq_symbols)}&f=sd2t2ohlcv&h&e=csv"
+    csv_text = fetch_text_url(url)
+    lines = [line.strip() for line in csv_text.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        return {}, url
+
+    quotes = {}
+    for row in lines[1:]:
+        cols = [c.strip().strip('"') for c in row.split(",")]
+        if len(cols) < 8:
+            continue
+        sym_raw = cols[0].lower()
+        symbol = mapping.get(sym_raw)
+        if not symbol:
+            continue
+        close_price = to_float_or_none(cols[6])
+        if close_price is None:
+            continue
+        date_part = cols[1] if cols[1] and cols[1] != "N/D" else ""
+        time_part = cols[2] if cols[2] and cols[2] != "N/D" else "00:00:00"
+        market_time = None
+        if date_part:
+            try:
+                dt = datetime.strptime(f"{date_part} {time_part}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                market_time = int(dt.timestamp())
+            except Exception:
+                market_time = None
+        quotes[symbol] = {
+            "symbol": symbol,
+            "name": symbol,
+            "price": close_price,
+            "currency": "USD",
+            "exchange": "STOOQ",
+            "change_percent": None,
+            "market_time": market_time,
+            "beta": None,
+            "market_cap": None,
+            "provider": "stooq",
+        }
+    return quotes, url
+
+
+def fetch_alpha_vantage_quotes(symbols):
+    """Tertiary provider: Alpha Vantage GLOBAL_QUOTE (requires API key)."""
+    if not symbols or not ALPHA_VANTAGE_API_KEY:
+        return {}, ""
+    quotes = {}
+    source_urls = []
+    for symbol in symbols:
+        normalized = normalize_ticker_symbol(symbol)
+        if not normalized:
+            continue
+        url = (
+            "https://www.alphavantage.co/query?function=GLOBAL_QUOTE"
+            f"&symbol={quote_plus(normalized)}&apikey={quote_plus(ALPHA_VANTAGE_API_KEY)}"
+        )
+        try:
+            payload = fetch_json_url(url)
+            source_urls.append(url)
+            gq = payload.get("Global Quote") or {}
+            price = to_float_or_none(gq.get("05. price"))
+            if price is None:
+                continue
+            change_percent_raw = (gq.get("10. change percent") or "").replace("%", "").strip()
+            change_percent = to_float_or_none(change_percent_raw)
+            market_time = None
+            latest_day = (gq.get("07. latest trading day") or "").strip()
+            if latest_day:
+                try:
+                    dt = datetime.strptime(latest_day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    market_time = int(dt.timestamp())
+                except Exception:
+                    market_time = None
+            quotes[normalized] = {
+                "symbol": normalized,
+                "name": normalized,
+                "price": price,
+                "currency": "USD",
+                "exchange": "ALPHA_VANTAGE",
+                "change_percent": change_percent,
+                "market_time": market_time,
+                "beta": None,
+                "market_cap": None,
+                "provider": "alpha_vantage",
+            }
+        except Exception:
+            continue
+    return quotes, (source_urls[0] if source_urls else "")
+
+
 def fetch_live_quotes(symbols):
-    """Fetch live or most-recent stock quotes from Yahoo Finance with short caching."""
+    """Fetch live or most-recent stock quotes with provider fallback chain."""
     requested = []
     for symbol in symbols:
         normalized = normalize_ticker_symbol(symbol)
@@ -1868,33 +2015,56 @@ def fetch_live_quotes(symbols):
                 missing.append(symbol)
 
     source_url = ""
+    used_sources = []
     if missing:
-        joined = ",".join(missing)
-        source_url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={quote_plus(joined)}"
-        payload = fetch_json_url(source_url)
-        fetched = ((payload.get("quoteResponse") or {}).get("result") or [])
+        remaining = list(missing)
+
+        # Provider 1: Yahoo Finance
+        try:
+            yahoo_quotes, yahoo_source = fetch_yahoo_quotes(remaining)
+            if yahoo_source:
+                used_sources.append(yahoo_source)
+            quotes.update(yahoo_quotes)
+        except Exception:
+            pass
+        remaining = [s for s in remaining if s not in quotes]
+
+        # Provider 2: Stooq fallback
+        if remaining:
+            try:
+                stooq_quotes, stooq_source = fetch_stooq_quotes(remaining)
+                if stooq_source:
+                    used_sources.append(stooq_source)
+                for symbol, quote in stooq_quotes.items():
+                    if symbol not in quotes:
+                        quotes[symbol] = quote
+            except Exception:
+                pass
+        remaining = [s for s in remaining if s not in quotes]
+
+        # Provider 3: Alpha Vantage fallback (optional API key)
+        if remaining and ALPHA_VANTAGE_API_KEY:
+            try:
+                av_quotes, av_source = fetch_alpha_vantage_quotes(remaining)
+                if av_source:
+                    used_sources.append(av_source)
+                for symbol, quote in av_quotes.items():
+                    if symbol not in quotes:
+                        quotes[symbol] = quote
+            except Exception:
+                pass
+
         now_cached_at = time.time()
         with finance_cache_lock:
-            for item in fetched:
-                symbol = normalize_ticker_symbol(item.get("symbol") or "")
-                if not symbol:
-                    continue
-                quote = {
-                    "symbol": symbol,
-                    "name": item.get("longName") or item.get("shortName") or symbol,
-                    "price": item.get("regularMarketPrice"),
-                    "currency": item.get("currency") or "USD",
-                    "exchange": item.get("fullExchangeName") or item.get("exchange") or "",
-                    "change_percent": item.get("regularMarketChangePercent"),
-                    "market_time": item.get("regularMarketTime"),
-                    "beta": item.get("beta"),
-                    "market_cap": item.get("marketCap"),
-                }
-                quotes[symbol] = quote
-                finance_quote_cache[symbol] = {
-                    "cached_at": now_cached_at,
-                    "quote": quote,
-                }
+            for symbol, quote in quotes.items():
+                if symbol in requested:
+                    finance_quote_cache[symbol] = {
+                        "cached_at": now_cached_at,
+                        "quote": quote,
+                    }
+
+        if used_sources:
+            source_url = " | ".join(used_sources)
 
     for symbol in requested:
         if symbol not in quotes:
