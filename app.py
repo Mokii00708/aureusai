@@ -60,6 +60,37 @@ idle_worker_started = False
 idle_learning_lock = threading.Lock()
 auth_rate_limit_lock = threading.Lock()
 auth_rate_limit_hits = {}
+finance_cache_lock = threading.Lock()
+finance_quote_cache = {}
+FINANCE_QUOTE_CACHE_TTL_SECONDS = int(os.getenv("FINANCE_QUOTE_CACHE_TTL_SECONDS", "60"))
+
+COMPANY_ALIAS_TO_TICKER = {
+    "apple": "AAPL",
+    "microsoft": "MSFT",
+    "google": "GOOGL",
+    "alphabet": "GOOGL",
+    "amazon": "AMZN",
+    "meta": "META",
+    "facebook": "META",
+    "tesla": "TSLA",
+    "nvidia": "NVDA",
+    "netflix": "NFLX",
+    "amd": "AMD",
+    "intel": "INTC",
+    "palantir": "PLTR",
+    "spotify": "SPOT",
+    "berkshire": "BRK.B",
+    "coca cola": "KO",
+    "nike": "NKE",
+    "visa": "V",
+    "mastercard": "MA",
+    "jp morgan": "JPM",
+    "jpmorgan": "JPM",
+    "goldman sachs": "GS",
+    "walmart": "WMT",
+    "disney": "DIS",
+    "pepsi": "PEP",
+}
 
 SYSTEM_PROMPT = """You are a warm, intelligent, and engaging conversational AI designed for meaningful chat. 
 You are helpful, thoughtful, and genuinely interested in the person you're talking with. 
@@ -1513,6 +1544,423 @@ def get_date_reply(include_sources=False):
     return with_citations(reply, ["Local system clock"], include_sources)
 
 
+def normalize_ticker_symbol(raw_symbol):
+    """Normalize stock ticker symbols to a safe uppercase format."""
+    cleaned = re.sub(r"[^A-Za-z0-9.\-]", "", raw_symbol or "").upper().strip()
+    if not cleaned or len(cleaned) > 12:
+        return ""
+    return cleaned
+
+
+def extract_ticker_candidates(text):
+    """Extract likely ticker symbols from arbitrary user text."""
+    raw = text or ""
+    lower = normalize_case(raw)
+    ignore = {
+        "A", "I", "US", "USD", "AND", "OR", "THE", "FOR", "NOW", "ALL", "PER", "MIN",
+    }
+
+    found = set()
+    for token in re.findall(r"\$([A-Za-z][A-Za-z0-9.\-]{0,10})\b", raw):
+        symbol = normalize_ticker_symbol(token)
+        if symbol and symbol not in ignore:
+            found.add(symbol)
+
+    for token in re.findall(r"\b[A-Z]{1,5}(?:\.[A-Z]{1,2})?\b", raw):
+        symbol = normalize_ticker_symbol(token)
+        if symbol and symbol not in ignore:
+            found.add(symbol)
+
+    for alias, ticker in COMPANY_ALIAS_TO_TICKER.items():
+        if alias in lower:
+            found.add(ticker)
+
+    return sorted(found)
+
+
+def resolve_ticker_from_company_name(company_name):
+    """Resolve a company name into a ticker symbol using Yahoo Finance search."""
+    candidate = (company_name or "").strip()
+    if not candidate:
+        return ""
+
+    direct = COMPANY_ALIAS_TO_TICKER.get(normalize_case(candidate))
+    if direct:
+        return direct
+
+    query = quote_plus(candidate)
+    url = f"https://query2.finance.yahoo.com/v1/finance/search?q={query}&quotesCount=5&newsCount=0"
+    try:
+        payload = fetch_json_url(url)
+        quotes = payload.get("quotes") or []
+        for item in quotes:
+            if not isinstance(item, dict):
+                continue
+            qtype = (item.get("quoteType") or "").upper()
+            symbol = normalize_ticker_symbol(item.get("symbol") or "")
+            if symbol and qtype in {"EQUITY", "ETF", "MUTUALFUND"}:
+                return symbol
+    except Exception:
+        return ""
+    return ""
+
+
+def parse_company_name_candidates(text):
+    """Extract company-name chunks from prompts like 'price of apple and tesla'."""
+    original = text or ""
+    lowered = normalize_case(original)
+    matches = []
+    patterns = [
+        r"(?:price|stock|share|quote|value)\s+(?:of|for)\s+([a-z0-9&\-\.,\s]+)",
+        r"(?:follow|track|watch)\s+([a-z0-9&\-\.,\s]+)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, lowered)
+        if m:
+            matches.append(m.group(1))
+
+    names = []
+    for chunk in matches:
+        parts = re.split(r",| and |\+|/", chunk)
+        for part in parts:
+            cleaned = re.sub(r"\b(stock|stocks|prices|market|firm|firms|company|companies|please|plz)\b", " ", part)
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            if len(cleaned) >= 2:
+                names.append(cleaned)
+    return names
+
+
+def fetch_live_quotes(symbols):
+    """Fetch live or most-recent stock quotes from Yahoo Finance with short caching."""
+    requested = []
+    for symbol in symbols:
+        normalized = normalize_ticker_symbol(symbol)
+        if normalized and normalized not in requested:
+            requested.append(normalized)
+    if not requested:
+        return {}, ""
+
+    now_ts = time.time()
+    quotes = {}
+    missing = []
+    with finance_cache_lock:
+        for symbol in requested:
+            cached = finance_quote_cache.get(symbol)
+            if cached and now_ts - cached.get("cached_at", 0) <= FINANCE_QUOTE_CACHE_TTL_SECONDS:
+                quotes[symbol] = cached.get("quote") or {}
+            else:
+                missing.append(symbol)
+
+    source_url = ""
+    if missing:
+        joined = ",".join(missing)
+        source_url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={quote_plus(joined)}"
+        payload = fetch_json_url(source_url)
+        fetched = ((payload.get("quoteResponse") or {}).get("result") or [])
+        now_cached_at = time.time()
+        with finance_cache_lock:
+            for item in fetched:
+                symbol = normalize_ticker_symbol(item.get("symbol") or "")
+                if not symbol:
+                    continue
+                quote = {
+                    "symbol": symbol,
+                    "name": item.get("longName") or item.get("shortName") or symbol,
+                    "price": item.get("regularMarketPrice"),
+                    "currency": item.get("currency") or "USD",
+                    "exchange": item.get("fullExchangeName") or item.get("exchange") or "",
+                    "change_percent": item.get("regularMarketChangePercent"),
+                    "market_time": item.get("regularMarketTime"),
+                }
+                quotes[symbol] = quote
+                finance_quote_cache[symbol] = {
+                    "cached_at": now_cached_at,
+                    "quote": quote,
+                }
+
+    for symbol in requested:
+        if symbol not in quotes:
+            with finance_cache_lock:
+                cached = finance_quote_cache.get(symbol)
+            if cached:
+                quotes[symbol] = cached.get("quote") or {}
+
+    return quotes, source_url
+
+
+def format_quote_timestamp(market_time):
+    """Convert market unix time to readable UTC text."""
+    if not market_time:
+        return "unknown"
+    try:
+        dt = datetime.fromtimestamp(int(market_time), tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return "unknown"
+
+
+def is_portfolio_comparison_query(normalized_text, original_text):
+    """Detect portfolio compare/analyze intents."""
+    markers = ["portfolio", "portoflio", "portfolios", "compare", "comparison", "analyse", "analyze", "vs", "versus"]
+    lowered = normalize_case(original_text)
+    if any(m in normalized_text for m in markers):
+        return True
+    return ("%" in original_text and ("vs" in lowered or "versus" in lowered))
+
+
+def parse_portfolio_definitions(text):
+    """Parse one or more portfolio definitions from natural language."""
+    raw = text or ""
+    split_text = re.sub(r"\bversus\b", " vs ", raw, flags=re.IGNORECASE)
+    parts = [p.strip() for p in re.split(r"\bvs\b", split_text, flags=re.IGNORECASE) if p.strip()]
+    if not parts:
+        parts = [raw.strip()]
+
+    portfolios = []
+    for idx, part in enumerate(parts, start=1):
+        name_match = re.search(r"(portfolio\s*[a-z0-9]*)\s*[:\-]", part, flags=re.IGNORECASE)
+        name = (name_match.group(1).strip().title() if name_match else f"Portfolio {chr(64 + idx)}")
+
+        holdings = {}
+        for match in re.finditer(r"(\d+(?:\.\d+)?)\s*%\s*([A-Za-z][A-Za-z0-9.\-]{0,10})", part):
+            weight = float(match.group(1))
+            ticker = normalize_ticker_symbol(match.group(2))
+            if ticker and weight > 0:
+                holdings[ticker] = holdings.get(ticker, 0.0) + weight
+
+        for match in re.finditer(r"([A-Za-z][A-Za-z0-9.\-]{0,10})\s*[:=]\s*(\d+(?:\.\d+)?)\s*%", part):
+            ticker = normalize_ticker_symbol(match.group(1))
+            weight = float(match.group(2))
+            if ticker and weight > 0:
+                holdings[ticker] = holdings.get(ticker, 0.0) + weight
+
+        if not holdings:
+            tickers = extract_ticker_candidates(part)
+            if tickers:
+                equal_weight = 100.0 / len(tickers)
+                for ticker in tickers:
+                    holdings[ticker] = equal_weight
+
+        total = sum(holdings.values())
+        if total <= 0:
+            continue
+        normalized_holdings = {ticker: weight / total for ticker, weight in holdings.items()}
+        portfolios.append({"name": name, "holdings": normalized_holdings})
+    return portfolios
+
+
+def extract_investment_amount_usd(text, default_amount=10000.0):
+    """Extract optional investment amount from prompt text."""
+    raw = text or ""
+    dollar_match = re.search(r"\$\s*([0-9][0-9,]*(?:\.[0-9]+)?)", raw)
+    if dollar_match:
+        try:
+            value = float(dollar_match.group(1).replace(",", ""))
+            if value > 0:
+                return value
+        except Exception:
+            pass
+
+    usd_match = re.search(r"([0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:usd|dollars?)\b", normalize_case(raw))
+    if usd_match:
+        try:
+            value = float(usd_match.group(1).replace(",", ""))
+            if value > 0:
+                return value
+        except Exception:
+            pass
+
+    return default_amount
+
+
+def summarize_portfolio(portfolio, quotes, investment_amount):
+    """Compute portfolio-level metrics from live quote data."""
+    name = portfolio.get("name") or "Portfolio"
+    holdings = portfolio.get("holdings") or {}
+    rows = []
+    weighted_change = 0.0
+    weighted_price = 0.0
+    hhi = 0.0
+    missing = []
+
+    for ticker, weight in holdings.items():
+        quote = quotes.get(ticker) or {}
+        price = quote.get("price")
+        change_pct = quote.get("change_percent")
+        if price is None:
+            missing.append(ticker)
+            continue
+        weight_pct = weight * 100.0
+        weighted_price += weight * float(price)
+        if isinstance(change_pct, (int, float)):
+            weighted_change += weight * float(change_pct)
+        hhi += weight * weight
+        allocation_value = investment_amount * weight
+        shares = allocation_value / float(price) if float(price) > 0 else 0.0
+        rows.append({
+            "ticker": ticker,
+            "weight_pct": weight_pct,
+            "price": float(price),
+            "change_pct": float(change_pct) if isinstance(change_pct, (int, float)) else None,
+            "allocation_value": allocation_value,
+            "shares": shares,
+        })
+
+    if hhi < 0.18:
+        diversification = "diversified"
+    elif hhi < 0.30:
+        diversification = "moderately concentrated"
+    else:
+        diversification = "highly concentrated"
+
+    return {
+        "name": name,
+        "rows": rows,
+        "weighted_change_pct": weighted_change,
+        "weighted_price": weighted_price,
+        "diversification": diversification,
+        "missing": missing,
+        "hhi": hhi,
+    }
+
+
+def get_portfolio_comparison_reply(normalized_text, original_text, include_sources=False):
+    """Compare portfolio setups using live market prices and latest daily changes."""
+    portfolios = parse_portfolio_definitions(original_text)
+    if not portfolios:
+        return ""
+
+    symbols = sorted({ticker for p in portfolios for ticker in (p.get("holdings") or {}).keys()})
+    if not symbols:
+        return ""
+
+    try:
+        quotes, source_url = fetch_live_quotes(symbols)
+    except Exception:
+        return "I could not fetch live market data right now. Please try again in a moment."
+
+    if not quotes:
+        return "I could not fetch live market quotes for those tickers."
+
+    investment_amount = extract_investment_amount_usd(original_text)
+    summaries = [summarize_portfolio(p, quotes, investment_amount) for p in portfolios]
+    valid = [s for s in summaries if s["rows"]]
+    if not valid:
+        return "I found the portfolios but could not retrieve valid prices for their tickers."
+
+    best_momentum = max(valid, key=lambda s: s.get("weighted_change_pct", -9999))
+    freshest_time = None
+    for quote in quotes.values():
+        market_time = quote.get("market_time")
+        if isinstance(market_time, (int, float)):
+            freshest_time = max(freshest_time or 0, int(market_time))
+
+    lines = []
+    lines.append(
+        "Portfolio comparison using latest market quotes. "
+        f"Data refreshes about every {FINANCE_QUOTE_CACHE_TTL_SECONDS} seconds in this app."
+    )
+    lines.append(f"Most recent market timestamp observed: {format_quote_timestamp(freshest_time)}.")
+    lines.append(f"Assumed investment per portfolio: ${investment_amount:,.2f}.")
+
+    for summary in valid:
+        lines.append("")
+        lines.append(
+            f"{summary['name']}: weighted intraday change {summary['weighted_change_pct']:+.2f}% | "
+            f"weighted price ${summary['weighted_price']:.2f} | {summary['diversification']}"
+        )
+        for row in sorted(summary["rows"], key=lambda r: r["weight_pct"], reverse=True):
+            change_text = f"{row['change_pct']:+.2f}%" if row["change_pct"] is not None else "n/a"
+            lines.append(
+                f"- {row['ticker']}: {row['weight_pct']:.1f}% | ${row['price']:.2f} | change {change_text} | "
+                f"alloc ${row['allocation_value']:.2f}"
+            )
+        if summary["missing"]:
+            lines.append(f"- Missing quotes: {', '.join(summary['missing'])}")
+
+    lines.append("")
+    lines.append(
+        f"By latest intraday momentum, {best_momentum['name']} is currently stronger "
+        f"({best_momentum['weighted_change_pct']:+.2f}%)."
+    )
+    lines.append("This is informational, not financial advice.")
+
+    sources = [source_url] if source_url else ["https://finance.yahoo.com/"]
+    return with_citations("\n".join(lines), sources, include_sources)
+
+
+def get_live_quote_reply(normalized_text, original_text, include_sources=False):
+    """Return live or most-recent prices for one or more firms/tickers."""
+    symbols = extract_ticker_candidates(original_text)
+    if not symbols:
+        for name in parse_company_name_candidates(original_text):
+            resolved = resolve_ticker_from_company_name(name)
+            if resolved:
+                symbols.append(resolved)
+
+    deduped = []
+    for symbol in symbols:
+        normalized = normalize_ticker_symbol(symbol)
+        if normalized and normalized not in deduped:
+            deduped.append(normalized)
+    symbols = deduped[:25]
+    if not symbols:
+        return ""
+
+    try:
+        quotes, source_url = fetch_live_quotes(symbols)
+    except Exception:
+        return "I could not fetch live quote data right now."
+
+    if not quotes:
+        return "I could not fetch quotes for those firms right now."
+
+    lines = []
+    lines.append(
+        "Latest stock quotes (live or most recent market print). "
+        f"Refresh cadence in this app is about every {FINANCE_QUOTE_CACHE_TTL_SECONDS} seconds."
+    )
+    for symbol in symbols:
+        quote = quotes.get(symbol) or {}
+        price = quote.get("price")
+        if price is None:
+            lines.append(f"- {symbol}: quote unavailable")
+            continue
+        name = quote.get("name") or symbol
+        currency = quote.get("currency") or "USD"
+        exchange = quote.get("exchange") or ""
+        change_pct = quote.get("change_percent")
+        change_text = f"{change_pct:+.2f}%" if isinstance(change_pct, (int, float)) else "n/a"
+        market_ts_text = format_quote_timestamp(quote.get("market_time"))
+        exchange_part = f" on {exchange}" if exchange else ""
+        lines.append(
+            f"- {symbol} ({name}): {price:.2f} {currency}{exchange_part} | change {change_text} | as of {market_ts_text}"
+        )
+
+    lines.append("If you want, I can keep tracking a watchlist and compare updates minute by minute.")
+    sources = [source_url] if source_url else ["https://finance.yahoo.com/"]
+    return with_citations("\n".join(lines), sources, include_sources)
+
+
+def get_finance_reply(normalized_text, original_text, include_sources=False):
+    """Handle finance/economics queries around quotes and portfolio comparison."""
+    if is_portfolio_comparison_query(normalized_text, original_text):
+        portfolio_reply = get_portfolio_comparison_reply(normalized_text, original_text, include_sources=include_sources)
+        if portfolio_reply:
+            return portfolio_reply
+
+    finance_markers = [
+        "portfolio", "portoflio", "stock", "stocks", "share price", "price per share", "quote", "ticker",
+        "market value", "market cap", "equity", "etf",
+    ]
+    if any(marker in normalized_text for marker in finance_markers):
+        quote_reply = get_live_quote_reply(normalized_text, original_text, include_sources=include_sources)
+        if quote_reply:
+            return quote_reply
+
+    return ""
+
+
 def extract_country_from_text(normalized_text):
     """Best-effort country extraction for factual queries."""
     m = re.search(r"\b(?:in|of|for)\s+([a-z\s]+)$", normalized_text)
@@ -2260,6 +2708,10 @@ def try_internet_answer(normalized_text, original_text="", include_sources=False
 
     if is_personal_message_intent(normalized_text):
         return None
+
+    finance_reply = get_finance_reply(normalized_text, original_text, include_sources=include_sources)
+    if finance_reply:
+        return finance_reply
 
     rewritten_possessive = rewrite_possessive_data_query(original_text)
     if rewritten_possessive:
@@ -3417,6 +3869,50 @@ def api_learning_status():
         "last_idle_run": learning_memory.get("last_idle_run", ""),
         "idle_runs": learning_memory.get("idle_runs", 0),
         "idle_topics_cached": len((learning_memory.get("idle_knowledge") or {})),
+    })
+
+
+@app.route("/api/finance/quotes", methods=["GET"])
+def api_finance_quotes():
+    """Return live or most-recent quote snapshots for comma-separated symbols."""
+    mark_user_activity()
+    symbols_raw = (request.args.get("symbols") or "").strip()
+    if not symbols_raw:
+        return jsonify({"error": "Query parameter 'symbols' is required."}), 400
+
+    symbols = []
+    for token in re.split(r"[,\s]+", symbols_raw):
+        symbol = normalize_ticker_symbol(token)
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+    symbols = symbols[:50]
+    if not symbols:
+        return jsonify({"error": "No valid symbols provided."}), 400
+
+    try:
+        quotes_map, source_url = fetch_live_quotes(symbols)
+    except Exception:
+        return jsonify({"error": "Failed to fetch finance data."}), 502
+
+    rows = []
+    for symbol in symbols:
+        quote = quotes_map.get(symbol) or {}
+        rows.append({
+            "symbol": symbol,
+            "name": quote.get("name") or symbol,
+            "price": quote.get("price"),
+            "currency": quote.get("currency") or "USD",
+            "exchange": quote.get("exchange") or "",
+            "change_percent": quote.get("change_percent"),
+            "market_time": quote.get("market_time"),
+            "market_time_utc": format_quote_timestamp(quote.get("market_time")),
+        })
+
+    return jsonify({
+        "as_of_utc": utc_now_iso(),
+        "cache_ttl_seconds": FINANCE_QUOTE_CACHE_TTL_SECONDS,
+        "source": source_url or "https://finance.yahoo.com/",
+        "quotes": rows,
     })
 
 
