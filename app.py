@@ -66,6 +66,23 @@ analytics_db_lock = threading.Lock()
 finance_cache_lock = threading.Lock()
 finance_quote_cache = {}
 FINANCE_QUOTE_CACHE_TTL_SECONDS = int(os.getenv("FINANCE_QUOTE_CACHE_TTL_SECONDS", "60"))
+HOME_COUNTRY = (os.getenv("HOME_COUNTRY") or "United States").strip()
+
+GEOPOLITICAL_EVENT_KEYWORDS = {
+    "tariff": ["tariff", "duties", "import duty", "trade barrier"],
+    "tax": ["tax law", "corporate tax", "vat", "levy", "fiscal reform"],
+    "shipping": ["shipping delay", "port congestion", "logistics", "freight", "supply chain"],
+    "sanction": ["sanction", "export control", "embargo", "restriction"],
+}
+
+DOMESTIC_SUPPLIER_CATALOG = [
+    {"name": "Great Lakes Steelworks", "country": "United States", "material": "steel", "quality": 92, "cost_index": 1.06},
+    {"name": "Midwest Alloy Partners", "country": "United States", "material": "steel", "quality": 89, "cost_index": 1.03},
+    {"name": "BlueRiver Metals", "country": "United States", "material": "steel", "quality": 87, "cost_index": 1.01},
+    {"name": "Atlas Polymer Labs", "country": "United States", "material": "polymer", "quality": 91, "cost_index": 1.04},
+    {"name": "Canyon Components", "country": "United States", "material": "electronics", "quality": 90, "cost_index": 1.07},
+    {"name": "Pioneer Industrial Inputs", "country": "United States", "material": "aluminum", "quality": 88, "cost_index": 1.05},
+]
 
 COMPANY_ALIAS_TO_TICKER = {
     "apple": "AAPL",
@@ -149,6 +166,33 @@ def ensure_analytics_db():
                     name TEXT NOT NULL,
                     amount REAL NOT NULL,
                     updated_at TEXT NOT NULL
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS supplier_profiles (
+                    user_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    country TEXT NOT NULL,
+                    material TEXT NOT NULL,
+                    quality_score REAL NOT NULL,
+                    spend_share REAL NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (user_id, name)
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS horizon_scan_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    headline TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    estimated_cogs_impact REAL NOT NULL,
+                    created_at TEXT NOT NULL
                 )
                 """
             )
@@ -297,6 +341,11 @@ def default_user_state():
             "auto_sweep_enabled": True,
             "auto_sweep_target": "investment index",
         },
+        "geopolitical_profile": {
+            "suppliers": [],
+            "last_scan_at": "",
+            "last_scan_summary": "",
+        },
     }
 
 
@@ -374,6 +423,17 @@ def load_user_state(user_id):
         auto_target = (behavior_profile.get("auto_sweep_target") or "").strip()
         behavior_profile["auto_sweep_target"] = auto_target or "investment index"
         state["behavior_budget_profile"] = behavior_profile
+
+        if not isinstance(state.get("geopolitical_profile"), dict):
+            state["geopolitical_profile"] = default_user_state()["geopolitical_profile"]
+        geo_profile = state.get("geopolitical_profile") or {}
+        if not isinstance(geo_profile.get("suppliers"), list):
+            geo_profile["suppliers"] = []
+        if not isinstance(geo_profile.get("last_scan_at"), str):
+            geo_profile["last_scan_at"] = ""
+        if not isinstance(geo_profile.get("last_scan_summary"), str):
+            geo_profile["last_scan_summary"] = ""
+        state["geopolitical_profile"] = geo_profile
         return state
     except Exception:
         return default_user_state()
@@ -2239,10 +2299,302 @@ def ensure_finance_profiles(user_state):
         })
     behavior_profile["spend_events"] = cleaned_events[-500:]
 
+    geo_profile = user_state.get("geopolitical_profile")
+    if not isinstance(geo_profile, dict):
+        geo_profile = json.loads(json.dumps(defaults["geopolitical_profile"]))
+    geo_profile.setdefault("suppliers", [])
+    geo_profile.setdefault("last_scan_at", "")
+    geo_profile.setdefault("last_scan_summary", "")
+
+    cleaned_suppliers = []
+    for item in geo_profile.get("suppliers") or []:
+        if not isinstance(item, dict):
+            continue
+        name = (item.get("name") or "").strip()
+        if not name:
+            continue
+        country = (item.get("country") or "Unknown").strip()
+        material = (item.get("material") or "other").strip().lower()
+        try:
+            quality = float(item.get("quality_score") or item.get("quality") or 75.0)
+        except Exception:
+            quality = 75.0
+        try:
+            spend_share = float(item.get("spend_share") or 0.0)
+        except Exception:
+            spend_share = 0.0
+        cleaned_suppliers.append({
+            "name": name,
+            "country": country,
+            "material": material,
+            "quality_score": max(0.0, min(100.0, quality)),
+            "spend_share": max(0.0, spend_share),
+            "updated_at": item.get("updated_at") or utc_now_iso(),
+        })
+    geo_profile["suppliers"] = cleaned_suppliers[:200]
+
     user_state["finance_profile"] = finance_profile
     user_state["subscription_profile"] = subscription_profile
     user_state["behavior_budget_profile"] = behavior_profile
+    user_state["geopolitical_profile"] = geo_profile
     return user_state
+
+
+def parse_supplier_add_payload(text):
+    """Parse supplier add command into structured supplier profile."""
+    raw = (text or "").strip()
+    normalized = normalize_case(raw)
+    if "supplier add" not in normalized and "add supplier" not in normalized:
+        return None
+
+    tokens = [t for t in re.split(r"\s+", raw) if t]
+    if len(tokens) < 4:
+        return None
+
+    lower_tokens = [normalize_case(t) for t in tokens]
+    marker_indexes = [i for i, t in enumerate(lower_tokens) if t in {"country", "material", "quality", "spend", "share"}]
+    start_idx = 0
+    for i in range(len(lower_tokens) - 1):
+        if (lower_tokens[i], lower_tokens[i + 1]) in {("supplier", "add"), ("add", "supplier")}:
+            start_idx = i + 2
+            break
+
+    first_marker = min(marker_indexes) if marker_indexes else len(tokens)
+    name_tokens = tokens[start_idx:first_marker]
+    if not name_tokens:
+        return None
+    name = " ".join(name_tokens).strip(" ,.-")
+    if not name:
+        return None
+
+    country_match = re.search(r"country\s+([a-zA-Z\s]+?)(?:\s+material\b|\s+quality\b|\s+spend\b|$)", raw, flags=re.IGNORECASE)
+    material_match = re.search(r"material\s+([a-zA-Z\-]+)", raw, flags=re.IGNORECASE)
+    quality_match = re.search(r"quality\s+([0-9]+(?:\.[0-9]+)?)", raw, flags=re.IGNORECASE)
+    spend_match = re.search(r"(?:spend|share)\s+([0-9]+(?:\.[0-9]+)?)\s*%?", raw, flags=re.IGNORECASE)
+
+    country = (country_match.group(1).strip() if country_match else "Unknown")
+    material = (material_match.group(1).strip().lower() if material_match else "other")
+    quality = float(quality_match.group(1)) if quality_match else 75.0
+    spend_share = float(spend_match.group(1)) if spend_match else 0.0
+
+    return {
+        "name": name,
+        "country": country,
+        "material": material,
+        "quality_score": max(0.0, min(100.0, quality)),
+        "spend_share": max(0.0, spend_share),
+        "updated_at": utc_now_iso(),
+    }
+
+
+def analytics_sql_upsert_supplier(user_id, supplier):
+    """Persist supplier profile in analytical SQL store."""
+    ensure_analytics_db()
+    with analytics_db_lock:
+        conn = sqlite3.connect(ANALYTICS_DB_FILE)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO supplier_profiles (user_id, name, country, material, quality_score, spend_share, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, name) DO UPDATE SET
+                    country=excluded.country,
+                    material=excluded.material,
+                    quality_score=excluded.quality_score,
+                    spend_share=excluded.spend_share,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    user_id,
+                    supplier.get("name") or "",
+                    supplier.get("country") or "Unknown",
+                    supplier.get("material") or "other",
+                    float(supplier.get("quality_score") or 75.0),
+                    float(supplier.get("spend_share") or 0.0),
+                    supplier.get("updated_at") or utc_now_iso(),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def analytics_sql_delete_supplier(user_id, supplier_name):
+    """Delete supplier profile from analytical SQL store."""
+    ensure_analytics_db()
+    with analytics_db_lock:
+        conn = sqlite3.connect(ANALYTICS_DB_FILE)
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM supplier_profiles WHERE user_id = ? AND lower(name) = lower(?)", (user_id, supplier_name))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def analytics_sql_record_horizon_event(user_id, event_type, headline, source_url, impact):
+    """Store horizon-scan event for historical aggregation."""
+    ensure_analytics_db()
+    with analytics_db_lock:
+        conn = sqlite3.connect(ANALYTICS_DB_FILE)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO horizon_scan_events (user_id, event_type, headline, source_url, estimated_cogs_impact, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, event_type, headline, source_url, float(impact), utc_now_iso()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def detect_event_type_from_headline(text):
+    """Infer geopolitical/regulatory event type from headline text."""
+    lowered = normalize_case(text)
+    for event_type, words in GEOPOLITICAL_EVENT_KEYWORDS.items():
+        if any(word in lowered for word in words):
+            return event_type
+    return "other"
+
+
+def shock_factor_for_event(event_type):
+    """Heuristic event shock multipliers used for COGS mapping."""
+    mapping = {
+        "tariff": 0.18,
+        "shipping": 0.10,
+        "tax": 0.06,
+        "sanction": 0.16,
+        "other": 0.04,
+    }
+    return mapping.get(event_type, 0.04)
+
+
+def fetch_geopolitical_news_snippets(materials):
+    """Fetch headlines from Google News RSS for geopolitical/regulatory scanning."""
+    snippets = []
+    sources = []
+    seeds = materials[:3] if materials else ["steel", "shipping", "corporate tax"]
+    for material in seeds:
+        query = f"{material} tariff tax law congress shipping delay"
+        url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en-US&gl=US&ceid=US:en"
+        try:
+            xml_text = fetch_text_url(url)
+            root = ET.fromstring(xml_text)
+            items = root.findall("./channel/item")[:4]
+            for item in items:
+                title = (item.findtext("title") or "").strip()
+                link = (item.findtext("link") or url).strip()
+                if title:
+                    snippets.append({"title": title, "link": link, "material": material})
+                    if link and link not in sources:
+                        sources.append(link)
+        except Exception:
+            continue
+    return snippets[:12], sources[:12]
+
+
+def recommend_alternative_suppliers(material, min_quality=75.0, top_k=3):
+    """Recommend domestic alternatives matching material and quality threshold."""
+    candidates = [
+        row for row in DOMESTIC_SUPPLIER_CATALOG
+        if row.get("material") == material and float(row.get("quality") or 0) >= min_quality
+    ]
+    if not candidates:
+        candidates = [row for row in DOMESTIC_SUPPLIER_CATALOG if row.get("material") == material]
+    candidates = sorted(candidates, key=lambda x: (-(float(x.get("quality") or 0)), float(x.get("cost_index") or 99)))
+    return candidates[:top_k]
+
+
+def build_geopolitical_horizon_report(user_id, user_state, include_sources=False):
+    """Map live geopolitical/regulatory headlines to supplier exposure and COGS impact."""
+    user_state = ensure_finance_profiles(user_state)
+    geo_profile = user_state.get("geopolitical_profile") or {}
+    suppliers = geo_profile.get("suppliers") or []
+    if not suppliers:
+        return "No supplier exposure data found. Add suppliers like: supplier add FerroSteel country China material steel quality 90 spend 32.", []
+
+    materials = sorted({(s.get("material") or "other").lower() for s in suppliers})
+    snippets, scan_sources = fetch_geopolitical_news_snippets(materials)
+
+    impacted_rows = []
+    total_impact = 0.0
+    for snippet in snippets:
+        headline = snippet.get("title") or ""
+        event_type = detect_event_type_from_headline(headline)
+        material = (snippet.get("material") or "other").lower()
+        base_shock = shock_factor_for_event(event_type)
+        for supplier in suppliers:
+            s_material = (supplier.get("material") or "other").lower()
+            if material != s_material:
+                continue
+            country = (supplier.get("country") or "Unknown").strip()
+            spend_share = float(supplier.get("spend_share") or 0.0) / 100.0
+            imported_multiplier = 1.0 if normalize_case(country) != normalize_case(HOME_COUNTRY) else 0.45
+            cogs_impact = spend_share * base_shock * imported_multiplier
+            if cogs_impact <= 0:
+                continue
+            impacted_rows.append({
+                "supplier": supplier.get("name") or "Supplier",
+                "country": country,
+                "material": s_material,
+                "event_type": event_type,
+                "headline": headline,
+                "impact_pct": cogs_impact * 100.0,
+                "source": snippet.get("link") or "",
+                "quality_score": float(supplier.get("quality_score") or 75.0),
+            })
+            total_impact += cogs_impact
+
+    impacted_rows = sorted(impacted_rows, key=lambda x: x["impact_pct"], reverse=True)
+    headline = "Geopolitical and Regulatory Horizon Scan"
+    if not impacted_rows:
+        text = (
+            f"{headline}: no high-confidence COGS shock was detected from current headlines, "
+            "but I recommend monitoring tariffs, logistics delays, and tax law updates weekly."
+        )
+        return with_citations(text, scan_sources or ["https://news.google.com/"], include_sources), scan_sources
+
+    top = impacted_rows[0]
+    total_impact_pct = total_impact * 100.0
+    lines = [
+        f"{headline}: detected elevated exposure from current policy/news signals.",
+        f"Top trigger: {top['headline']}",
+        (
+            f"Estimated COGS impact next quarter: {total_impact_pct:.2f}% based on your supplier mix "
+            f"(largest single path: {top['supplier']} {top['impact_pct']:.2f}%)."
+        ),
+    ]
+
+    affected_material = top.get("material") or "steel"
+    min_quality = max(70.0, top.get("quality_score", 75.0) - 5.0)
+    alternatives = recommend_alternative_suppliers(affected_material, min_quality=min_quality, top_k=3)
+    if alternatives:
+        lines.append("Recommended domestic alternatives matching your quality target:")
+        for idx, alt in enumerate(alternatives, start=1):
+            lines.append(
+                f"{idx}. {alt['name']} ({alt['country']}) | material {alt['material']} | quality {float(alt['quality']):.0f} | cost index {float(alt['cost_index']):.2f}"
+            )
+
+    lines.append("Suggested actions: hedge contract terms, rebalance supplier share, and secure 2 backup contracts this quarter.")
+    text = "\n".join(lines)
+
+    for row in impacted_rows[:4]:
+        analytics_sql_record_horizon_event(
+            user_id=user_id,
+            event_type=row.get("event_type") or "other",
+            headline=row.get("headline") or "",
+            source_url=row.get("source") or "https://news.google.com/",
+            impact=row.get("impact_pct") or 0.0,
+        )
+
+    geo_profile["last_scan_at"] = utc_now_iso()
+    geo_profile["last_scan_summary"] = text[:4000]
+    user_state["geopolitical_profile"] = geo_profile
+    return with_citations(text, scan_sources or ["https://news.google.com/"], include_sources), scan_sources
 
 
 def parse_symbol_or_company_list(text):
@@ -3168,6 +3520,7 @@ def analytics_sql_behavior_insights(user_id):
 def linguistic_engine_parse_intent(user_message):
     """Linguistic engine: parse natural language into analytical intent payloads."""
     normalized = normalize_intent_text(user_message)
+    raw_lower = normalize_case(user_message)
 
     watchlist_cmd = detect_watchlist_command(normalized)
     if watchlist_cmd:
@@ -3217,6 +3570,25 @@ def linguistic_engine_parse_intent(user_message):
         target_text = re.sub(r".*(?:sweep target|set target)", "", user_message, flags=re.IGNORECASE).strip(" :.-")
         return {"action": "auto_sweep_target", "target": target_text}
 
+    if any(x in normalized for x in ["supplier add", "add supplier"]):
+        payload = parse_supplier_add_payload(user_message)
+        if payload:
+            return {"action": "supplier_add", "payload": payload}
+
+    if any(x in normalized for x in ["supplier remove", "remove supplier"]):
+        payload = re.sub(r"supplier remove|remove supplier", " ", user_message, flags=re.IGNORECASE)
+        target = re.sub(r"\s+", " ", payload).strip(" ,.-")
+        return {"action": "supplier_remove", "name": target}
+
+    if any(x in normalized for x in ["supplier list", "list suppliers", "show suppliers", "my suppliers"]):
+        return {"action": "supplier_list"}
+
+    if any(x in raw_lower for x in ["geopolitical scan", "horizon scan", "regulatory scan", "tariff impact", "legislation impact", "policy impact"]):
+        return {"action": "geopolitical_scan"}
+
+    if re.search(r"\b(geopolit|regulator|tariff|tax law|legislation|congress|shipping delay|supply chain disruption)\b", raw_lower):
+        return {"action": "geopolitical_scan"}
+
     spend_payload = parse_spend_log_payload(user_message)
     if spend_payload:
         return {"action": "spend_log", "payload": spend_payload}
@@ -3234,6 +3606,7 @@ def analytical_engine_execute(user_id, user_state, intent):
     finance_profile = user_state.get("finance_profile") or {}
     subscription_profile = user_state.get("subscription_profile") or {}
     behavior_profile = user_state.get("behavior_budget_profile") or {}
+    geo_profile = user_state.get("geopolitical_profile") or {}
 
     if action == "watchlist_show":
         reply_text = get_watchlist_summary_reply(user_state, include_sources=False)
@@ -3407,6 +3780,78 @@ def analytical_engine_execute(user_id, user_state, intent):
         behavior_profile["last_coach_alert_at"] = utc_now_iso()
         user_state["behavior_budget_profile"] = behavior_profile
         return {"ok": True, "action": action, "state_changed": True, "text": f"Auto-sweep target updated to: {target}."}
+
+    if action == "supplier_add":
+        payload = intent.get("payload") or {}
+        suppliers = geo_profile.get("suppliers") or []
+        existing = None
+        for row in suppliers:
+            if normalize_case(row.get("name")) == normalize_case(payload.get("name")):
+                existing = row
+                break
+        if existing:
+            existing.update(payload)
+            existing["updated_at"] = utc_now_iso()
+            action_word = "updated"
+            analytics_sql_upsert_supplier(user_id, existing)
+        else:
+            new_row = {
+                "name": payload.get("name") or "",
+                "country": payload.get("country") or "Unknown",
+                "material": payload.get("material") or "other",
+                "quality_score": float(payload.get("quality_score") or 75.0),
+                "spend_share": float(payload.get("spend_share") or 0.0),
+                "updated_at": utc_now_iso(),
+            }
+            suppliers.append(new_row)
+            action_word = "added"
+            analytics_sql_upsert_supplier(user_id, new_row)
+        geo_profile["suppliers"] = suppliers[:200]
+        user_state["geopolitical_profile"] = geo_profile
+        return {
+            "ok": True,
+            "action": action,
+            "state_changed": True,
+            "text": (
+                f"Supplier {action_word}: {payload.get('name')} | country {payload.get('country')} | "
+                f"material {payload.get('material')} | quality {float(payload.get('quality_score') or 0):.0f} | spend share {float(payload.get('spend_share') or 0):.1f}%"
+            ),
+        }
+
+    if action == "supplier_remove":
+        target = (intent.get("name") or "").strip()
+        if not target:
+            return {"ok": True, "action": action, "state_changed": False, "text": "Tell me which supplier to remove."}
+        suppliers = geo_profile.get("suppliers") or []
+        before = len(suppliers)
+        suppliers = [row for row in suppliers if normalize_case(row.get("name")) != normalize_case(target)]
+        geo_profile["suppliers"] = suppliers
+        user_state["geopolitical_profile"] = geo_profile
+        if len(suppliers) != before:
+            analytics_sql_delete_supplier(user_id, target)
+            return {"ok": True, "action": action, "state_changed": True, "text": f"Removed supplier: {target}."}
+        return {"ok": True, "action": action, "state_changed": False, "text": "Supplier not found in your profile."}
+
+    if action == "supplier_list":
+        suppliers = geo_profile.get("suppliers") or []
+        if not suppliers:
+            return {"ok": True, "action": action, "state_changed": False, "text": "No suppliers saved yet. Add one with: supplier add <name> country <country> material <material> quality <score> spend <percent>."}
+        lines = ["Supplier exposure profile:"]
+        for row in suppliers[:20]:
+            lines.append(
+                f"- {row.get('name')}: {row.get('country')} | {row.get('material')} | quality {float(row.get('quality_score') or 0):.0f} | spend {float(row.get('spend_share') or 0):.1f}%"
+            )
+        return {"ok": True, "action": action, "state_changed": False, "text": "\n".join(lines)}
+
+    if action == "geopolitical_scan":
+        report_text, sources = build_geopolitical_horizon_report(user_id, user_state, include_sources=False)
+        return {
+            "ok": True,
+            "action": action,
+            "state_changed": True,
+            "text": report_text,
+            "source": (sources[0] if sources else "https://news.google.com/"),
+        }
 
     return {"ok": False}
 
@@ -5658,6 +6103,102 @@ def api_finance_weekly_pdf():
     response.headers["Content-Disposition"] = "attachment; filename=weekly_finance_report.pdf"
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+@app.route("/api/finance/geopolitical/suppliers", methods=["GET", "POST", "DELETE"])
+def api_finance_geopolitical_suppliers():
+    """Manage supplier exposure profiles used by horizon scanning."""
+    mark_user_activity()
+    session_user_id = resolve_session_user_id()
+    user_id = sanitize_user_id(session_user_id or request.args.get("user_id") or DEFAULT_USER_ID)
+    user_state = ensure_finance_profiles(load_user_state(user_id))
+    geo_profile = user_state.get("geopolitical_profile") or {}
+
+    if request.method == "GET":
+        return jsonify({
+            "user_id": user_id,
+            "home_country": HOME_COUNTRY,
+            "suppliers": geo_profile.get("suppliers") or [],
+            "last_scan_at": geo_profile.get("last_scan_at") or "",
+        })
+
+    if reject_large_request(8192):
+        return jsonify({"error": "Payload too large."}), 413
+    data = request.get_json(silent=True) or {}
+
+    if request.method == "POST":
+        name = (data.get("name") or "").strip()
+        country = (data.get("country") or "Unknown").strip()
+        material = (data.get("material") or "other").strip().lower()
+        if not name:
+            return jsonify({"error": "name is required."}), 400
+        try:
+            quality_score = float(data.get("quality_score") or data.get("quality") or 75.0)
+        except Exception:
+            quality_score = 75.0
+        try:
+            spend_share = float(data.get("spend_share") or 0.0)
+        except Exception:
+            spend_share = 0.0
+
+        row = {
+            "name": name,
+            "country": country,
+            "material": material,
+            "quality_score": max(0.0, min(100.0, quality_score)),
+            "spend_share": max(0.0, spend_share),
+            "updated_at": utc_now_iso(),
+        }
+
+        suppliers = geo_profile.get("suppliers") or []
+        existing = None
+        for item in suppliers:
+            if normalize_case(item.get("name")) == normalize_case(name):
+                existing = item
+                break
+        if existing:
+            existing.update(row)
+        else:
+            suppliers.append(row)
+        geo_profile["suppliers"] = suppliers[:200]
+        user_state["geopolitical_profile"] = geo_profile
+        analytics_sql_upsert_supplier(user_id, row)
+        save_user_state(user_id, user_state)
+        return jsonify({"status": "ok", "user_id": user_id, "suppliers": geo_profile["suppliers"]})
+
+    name = (data.get("name") or "").strip()
+    clear_all = parse_bool(data.get("clear"), default=False)
+    suppliers = geo_profile.get("suppliers") or []
+    if clear_all:
+        suppliers = []
+    else:
+        if not name:
+            return jsonify({"error": "name is required unless clear=true."}), 400
+        suppliers = [row for row in suppliers if normalize_case(row.get("name")) != normalize_case(name)]
+        analytics_sql_delete_supplier(user_id, name)
+    geo_profile["suppliers"] = suppliers
+    user_state["geopolitical_profile"] = geo_profile
+    save_user_state(user_id, user_state)
+    return jsonify({"status": "ok", "user_id": user_id, "suppliers": suppliers})
+
+
+@app.route("/api/finance/geopolitical/scan", methods=["GET"])
+def api_finance_geopolitical_scan():
+    """Run geopolitical and regulatory horizon scan against supplier exposure."""
+    mark_user_activity()
+    session_user_id = resolve_session_user_id()
+    user_id = sanitize_user_id(session_user_id or request.args.get("user_id") or DEFAULT_USER_ID)
+    include_sources = parse_bool(request.args.get("include_sources"), default=False)
+    user_state = ensure_finance_profiles(load_user_state(user_id))
+    report_text, sources = build_geopolitical_horizon_report(user_id, user_state, include_sources=include_sources)
+    save_user_state(user_id, user_state)
+    return jsonify({
+        "user_id": user_id,
+        "as_of_utc": utc_now_iso(),
+        "home_country": HOME_COUNTRY,
+        "report": report_text,
+        "sources": sources,
+    })
 
 
 @app.route("/IMG_9664.jpeg")
