@@ -2151,9 +2151,17 @@ def get_live_quote_reply(normalized_text, original_text, include_sources=False):
     try:
         quotes, source_url = fetch_live_quotes(symbols)
     except Exception:
+        fallback_query = f"latest stock price {', '.join(symbols)}"
+        fallback = get_web_search_reply(fallback_query, include_sources=include_sources)
+        if fallback and not is_weak_web_response(fallback):
+            return fallback
         return "I could not fetch live quote data right now."
 
     if not quotes:
+        fallback_query = f"latest stock price {', '.join(symbols)}"
+        fallback = get_web_search_reply(fallback_query, include_sources=include_sources)
+        if fallback and not is_weak_web_response(fallback):
+            return fallback
         return "I could not fetch quotes for those firms right now."
 
     lines = []
@@ -2191,10 +2199,12 @@ def get_finance_reply(normalized_text, original_text, include_sources=False):
             return portfolio_reply
 
     finance_markers = [
-        "portfolio", "portoflio", "stock", "stocks", "share price", "price per share", "quote", "ticker",
-        "market value", "market cap", "equity", "etf",
+        "portfolio", "portoflio", "stock", "stocks", "share", "shares", "share price", "price per share",
+        "quote", "ticker", "market value", "market cap", "equity", "etf",
+        "action", "actions", "accion", "acciones", "cotizacion", "precio",
     ]
-    if any(marker in normalized_text for marker in finance_markers):
+    symbol_candidates = extract_ticker_candidates(original_text)
+    if any(marker in normalized_text for marker in finance_markers) or bool(symbol_candidates):
         quote_reply = get_live_quote_reply(normalized_text, original_text, include_sources=include_sources)
         if quote_reply:
             return quote_reply
