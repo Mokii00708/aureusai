@@ -238,6 +238,13 @@ def default_user_state():
             },
             "last_alert_at": "",
         },
+        "behavior_budget_profile": {
+            "spend_events": [],
+            "last_coach_alert_at": "",
+            "last_daily_alert_date": "",
+            "auto_sweep_enabled": True,
+            "auto_sweep_target": "investment index",
+        },
     }
 
 
@@ -300,6 +307,21 @@ def load_user_state(user_id):
         if not isinstance(subscription_profile.get("last_alert_at"), str):
             subscription_profile["last_alert_at"] = ""
         state["subscription_profile"] = subscription_profile
+
+        if not isinstance(state.get("behavior_budget_profile"), dict):
+            state["behavior_budget_profile"] = default_user_state()["behavior_budget_profile"]
+        behavior_profile = state.get("behavior_budget_profile") or {}
+        if not isinstance(behavior_profile.get("spend_events"), list):
+            behavior_profile["spend_events"] = []
+        if not isinstance(behavior_profile.get("last_coach_alert_at"), str):
+            behavior_profile["last_coach_alert_at"] = ""
+        if not isinstance(behavior_profile.get("last_daily_alert_date"), str):
+            behavior_profile["last_daily_alert_date"] = ""
+        if not isinstance(behavior_profile.get("auto_sweep_enabled"), bool):
+            behavior_profile["auto_sweep_enabled"] = True
+        auto_target = (behavior_profile.get("auto_sweep_target") or "").strip()
+        behavior_profile["auto_sweep_target"] = auto_target or "investment index"
+        state["behavior_budget_profile"] = behavior_profile
         return state
     except Exception:
         return default_user_state()
@@ -1751,6 +1773,8 @@ def fetch_live_quotes(symbols):
                     "exchange": item.get("fullExchangeName") or item.get("exchange") or "",
                     "change_percent": item.get("regularMarketChangePercent"),
                     "market_time": item.get("regularMarketTime"),
+                    "beta": item.get("beta"),
+                    "market_cap": item.get("marketCap"),
                 }
                 quotes[symbol] = quote
                 finance_quote_cache[symbol] = {
@@ -1861,6 +1885,8 @@ def summarize_portfolio(portfolio, quotes, investment_amount):
     weighted_change = 0.0
     weighted_price = 0.0
     hhi = 0.0
+    weighted_beta = 0.0
+    beta_weight_sum = 0.0
     missing = []
 
     for ticker, weight in holdings.items():
@@ -1875,6 +1901,10 @@ def summarize_portfolio(portfolio, quotes, investment_amount):
         if isinstance(change_pct, (int, float)):
             weighted_change += weight * float(change_pct)
         hhi += weight * weight
+        beta = quote.get("beta")
+        if isinstance(beta, (int, float)):
+            weighted_beta += weight * float(beta)
+            beta_weight_sum += weight
         allocation_value = investment_amount * weight
         shares = allocation_value / float(price) if float(price) > 0 else 0.0
         rows.append({
@@ -1893,12 +1923,26 @@ def summarize_portfolio(portfolio, quotes, investment_amount):
     else:
         diversification = "highly concentrated"
 
+    effective_beta = weighted_beta / beta_weight_sum if beta_weight_sum > 0 else None
+    if effective_beta is None:
+        risk_band = "risk data limited"
+    elif effective_beta < 0.8:
+        risk_band = "defensive"
+    elif effective_beta < 1.2:
+        risk_band = "balanced"
+    elif effective_beta < 1.6:
+        risk_band = "growth-tilted"
+    else:
+        risk_band = "high-volatility"
+
     return {
         "name": name,
         "rows": rows,
         "weighted_change_pct": weighted_change,
         "weighted_price": weighted_price,
         "diversification": diversification,
+        "effective_beta": effective_beta,
+        "risk_band": risk_band,
         "missing": missing,
         "hhi": hhi,
     }
@@ -1947,8 +1991,11 @@ def get_portfolio_comparison_reply(normalized_text, original_text, include_sourc
         lines.append("")
         lines.append(
             f"{summary['name']}: weighted intraday change {summary['weighted_change_pct']:+.2f}% | "
-            f"weighted price ${summary['weighted_price']:.2f} | {summary['diversification']}"
+            f"weighted price ${summary['weighted_price']:.2f} | {summary['diversification']} | "
+            f"risk {summary['risk_band']}"
         )
+        if summary.get("effective_beta") is not None:
+            lines.append(f"- beta proxy: {summary['effective_beta']:.2f}")
         for row in sorted(summary["rows"], key=lambda r: r["weight_pct"], reverse=True):
             change_text = f"{row['change_pct']:+.2f}%" if row["change_pct"] is not None else "n/a"
             lines.append(
@@ -2100,8 +2147,47 @@ def ensure_finance_profiles(user_state):
         })
     subscription_profile["items"] = cleaned_items[:120]
 
+    behavior_profile = user_state.get("behavior_budget_profile")
+    if not isinstance(behavior_profile, dict):
+        behavior_profile = json.loads(json.dumps(defaults["behavior_budget_profile"]))
+    behavior_profile.setdefault("spend_events", [])
+    behavior_profile.setdefault("last_coach_alert_at", "")
+    behavior_profile.setdefault("last_daily_alert_date", "")
+    if not isinstance(behavior_profile.get("auto_sweep_enabled"), bool):
+        behavior_profile["auto_sweep_enabled"] = True
+    auto_sweep_target = (behavior_profile.get("auto_sweep_target") or "").strip()
+    behavior_profile["auto_sweep_target"] = auto_sweep_target or "investment index"
+
+    cleaned_events = []
+    for item in behavior_profile.get("spend_events") or []:
+        if not isinstance(item, dict):
+            continue
+        category = (item.get("category") or "other").strip().lower() or "other"
+        try:
+            amount = float(item.get("amount") or 0.0)
+        except Exception:
+            amount = 0.0
+        day_of_week = (item.get("day_of_week") or "").strip() or datetime.now().strftime("%A")
+        try:
+            hour = int(item.get("hour") if item.get("hour") is not None else datetime.now().hour)
+        except Exception:
+            hour = datetime.now().hour
+        stress_level = (item.get("stress_level") or "medium").strip().lower()
+        if stress_level not in {"low", "medium", "high"}:
+            stress_level = "medium"
+        cleaned_events.append({
+            "amount": max(0.0, amount),
+            "category": category,
+            "day_of_week": day_of_week,
+            "hour": max(0, min(23, hour)),
+            "stress_level": stress_level,
+            "timestamp": item.get("timestamp") or utc_now_iso(),
+        })
+    behavior_profile["spend_events"] = cleaned_events[-500:]
+
     user_state["finance_profile"] = finance_profile
     user_state["subscription_profile"] = subscription_profile
+    user_state["behavior_budget_profile"] = behavior_profile
     return user_state
 
 
@@ -2351,6 +2437,224 @@ def build_subscription_decay_report(user_state, include_sources=False):
     return with_citations("\n".join(lines), ["User-provided subscription and usage inputs"], include_sources)
 
 
+def infer_stress_level(text):
+    """Infer stress level from user wording."""
+    lowered = normalize_case(text)
+    high_markers = ["stressed", "stressful", "tough week", "exhausted", "burned out", "overwhelmed", "bad day"]
+    low_markers = ["calm", "good day", "relaxed", "chill"]
+    if any(m in lowered for m in high_markers):
+        return "high"
+    if any(m in lowered for m in low_markers):
+        return "low"
+    return "medium"
+
+
+def parse_spend_log_payload(user_message):
+    """Parse spend log command into normalized event payload."""
+    text = user_message or ""
+    normalized = normalize_case(text)
+    if not any(k in normalized for k in ["spend", "spent", "expense", "log spend"]):
+        return None
+
+    amount_match = re.search(r"\$?\s*([0-9]+(?:\.[0-9]+)?)", text)
+    if not amount_match:
+        return None
+    try:
+        amount = float(amount_match.group(1))
+    except Exception:
+        return None
+    if amount <= 0:
+        return None
+
+    categories = ["takeout", "food", "shopping", "transport", "entertainment", "drinks", "groceries", "coffee", "other"]
+    category = "other"
+    for cat in categories:
+        if cat in normalized:
+            category = cat
+            break
+
+    day_match = re.search(
+        r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        normalized,
+    )
+    day_of_week = day_match.group(1).capitalize() if day_match else datetime.now().strftime("%A")
+
+    hour_match = re.search(r"\b([01]?\d|2[0-3])\s*[:h]?\s*(?:00)?\b", normalized)
+    hour = int(hour_match.group(1)) if hour_match else datetime.now().hour
+    stress_level = infer_stress_level(text)
+
+    return {
+        "amount": amount,
+        "category": category,
+        "day_of_week": day_of_week,
+        "hour": max(0, min(23, hour)),
+        "stress_level": stress_level,
+        "timestamp": utc_now_iso(),
+    }
+
+
+def add_spend_event(user_state, spend_event):
+    """Append a spend event to behavioral profile."""
+    user_state = ensure_finance_profiles(user_state)
+    profile = user_state.get("behavior_budget_profile") or {}
+    events = profile.get("spend_events") or []
+    events.append(spend_event)
+    profile["spend_events"] = events[-500:]
+    profile["last_coach_alert_at"] = utc_now_iso()
+    user_state["behavior_budget_profile"] = profile
+    return user_state
+
+
+def analyze_behavioral_spending_patterns(user_state):
+    """Derive spending trigger insights from historical spend events."""
+    user_state = ensure_finance_profiles(user_state)
+    profile = user_state.get("behavior_budget_profile") or {}
+    events = profile.get("spend_events") or []
+    if len(events) < 5:
+        return {
+            "event_count": len(events),
+            "top_trigger": "",
+            "friday_late_multiplier": 1.0,
+            "high_stress_multiplier": 1.0,
+            "common_category": "",
+            "estimated_avoidable_spend": 0.0,
+        }
+
+    total_amount = sum(float(e.get("amount") or 0.0) for e in events)
+    avg_all = total_amount / len(events) if events else 0.0
+
+    friday_late = [e for e in events if e.get("day_of_week") == "Friday" and int(e.get("hour") or 0) >= 17]
+    high_stress = [e for e in events if (e.get("stress_level") or "") == "high"]
+    friday_avg = sum(float(e.get("amount") or 0.0) for e in friday_late) / len(friday_late) if friday_late else avg_all
+    stress_avg = sum(float(e.get("amount") or 0.0) for e in high_stress) / len(high_stress) if high_stress else avg_all
+
+    category_totals = {}
+    for e in events:
+        cat = (e.get("category") or "other").strip().lower()
+        category_totals[cat] = category_totals.get(cat, 0.0) + float(e.get("amount") or 0.0)
+    common_category = max(category_totals, key=category_totals.get) if category_totals else "other"
+
+    friday_mult = (friday_avg / avg_all) if avg_all > 0 else 1.0
+    stress_mult = (stress_avg / avg_all) if avg_all > 0 else 1.0
+    avoidable = max(0.0, friday_avg - avg_all)
+
+    trigger_parts = []
+    if friday_mult >= 1.2:
+        trigger_parts.append("Friday evening")
+    if stress_mult >= 1.2:
+        trigger_parts.append("high-stress days")
+    top_trigger = " and ".join(trigger_parts)
+
+    return {
+        "event_count": len(events),
+        "top_trigger": top_trigger,
+        "friday_late_multiplier": friday_mult,
+        "high_stress_multiplier": stress_mult,
+        "common_category": common_category,
+        "estimated_avoidable_spend": avoidable,
+    }
+
+
+def build_behavioral_budget_summary(user_state):
+    """Summarize learned behavioral spending patterns."""
+    insights = analyze_behavioral_spending_patterns(user_state)
+    if insights["event_count"] < 5:
+        return "I need at least 5 spend logs to learn your emotional spending triggers accurately."
+
+    lines = [
+        "Behavioral budgeting insights:",
+        f"- Logged events: {insights['event_count']}",
+        f"- Top spend category: {insights['common_category']}",
+        f"- Friday evening spend multiplier: {insights['friday_late_multiplier']:.2f}x",
+        f"- High-stress spend multiplier: {insights['high_stress_multiplier']:.2f}x",
+    ]
+    if insights["top_trigger"]:
+        lines.append(f"- Emotional trigger pattern detected: {insights['top_trigger']}")
+    lines.append(f"- Estimated avoidable spend per trigger window: ${insights['estimated_avoidable_spend']:.2f}")
+    return "\n".join(lines)
+
+
+def build_empathetic_budget_nudge(user_state, now_dt=None):
+    """Create proactive empathetic nudge based on behavior and current context."""
+    user_state = ensure_finance_profiles(user_state)
+    now_dt = now_dt or datetime.now()
+    insights = analyze_behavioral_spending_patterns(user_state)
+    if insights["event_count"] < 5:
+        return ""
+
+    day_name = now_dt.strftime("%A")
+    hour = now_dt.hour
+    likely_window = (day_name == "Friday" and hour >= 14) or (insights["high_stress_multiplier"] >= 1.15)
+    if not likely_window:
+        return ""
+
+    suggested_save = max(10.0, min(120.0, insights["estimated_avoidable_spend"] or 25.0))
+    behavior_profile = user_state.get("behavior_budget_profile") or {}
+    target = behavior_profile.get("auto_sweep_target") or "investment index"
+    auto_sweep_enabled = bool(behavior_profile.get("auto_sweep_enabled", True))
+    category = insights.get("common_category") or "takeout"
+    if auto_sweep_enabled:
+        return (
+            "Hey, it has been a tough week. "
+            f"You usually spend more on {category} around this time. "
+            f"If you skip it tonight, I will auto-sweep about ${suggested_save:.0f} into your {target}. What do you think?"
+        )
+    return (
+        "Hey, it has been a tough week. "
+        f"You usually spend more on {category} around this time. "
+        f"If you skip it tonight, you can manually move about ${suggested_save:.0f} toward your {target}."
+    )
+
+
+def apply_behavior_budget_command(user_state, user_message):
+    """Apply behavioral budgeting commands and return reply/state-changed tuple."""
+    user_state = ensure_finance_profiles(user_state)
+    normalized = normalize_intent_text(user_message)
+    behavior_profile = user_state.get("behavior_budget_profile") or {}
+
+    if any(x in normalized for x in ["behavior summary", "spending triggers", "show triggers", "budget psychology", "behavioral budgeting"]):
+        return build_behavioral_budget_summary(user_state), False
+
+    if any(x in normalized for x in ["coach nudge", "budget nudge", "financial coach", "coach me"]):
+        nudge = build_empathetic_budget_nudge(user_state)
+        if nudge:
+            behavior_profile["last_coach_alert_at"] = utc_now_iso()
+            user_state["behavior_budget_profile"] = behavior_profile
+            return nudge, True
+        return "No urgent trigger window detected right now. I can still help with a low-spend alternative plan.", False
+
+    if any(x in normalized for x in ["auto sweep on", "enable auto sweep"]):
+        behavior_profile["auto_sweep_enabled"] = True
+        behavior_profile["last_coach_alert_at"] = utc_now_iso()
+        user_state["behavior_budget_profile"] = behavior_profile
+        return "Auto-sweep is enabled for your coaching nudges.", True
+
+    if any(x in normalized for x in ["auto sweep off", "disable auto sweep"]):
+        behavior_profile["auto_sweep_enabled"] = False
+        behavior_profile["last_coach_alert_at"] = utc_now_iso()
+        user_state["behavior_budget_profile"] = behavior_profile
+        return "Auto-sweep is disabled.", True
+
+    if any(x in normalized for x in ["sweep target", "set target"]):
+        target_text = re.sub(r".*(?:sweep target|set target)", "", user_message, flags=re.IGNORECASE).strip(" :.-")
+        if not target_text:
+            return "Set target like: sweep target investment index.", False
+        behavior_profile["auto_sweep_target"] = target_text
+        behavior_profile["last_coach_alert_at"] = utc_now_iso()
+        user_state["behavior_budget_profile"] = behavior_profile
+        return f"Auto-sweep target updated to: {target_text}.", True
+
+    spend_event = parse_spend_log_payload(user_message)
+    if spend_event:
+        user_state = add_spend_event(user_state, spend_event)
+        return (
+            f"Spend logged: ${spend_event['amount']:.2f} on {spend_event['category']} "
+            f"({spend_event['day_of_week']} {spend_event['hour']:02d}:00, stress {spend_event['stress_level']})."
+        ), True
+
+    return "", False
+
+
 def apply_subscription_command(user_state, user_message, include_sources=False):
     """Apply subscription management commands and return reply/state-changed tuple."""
     user_state = ensure_finance_profiles(user_state)
@@ -2470,13 +2774,163 @@ def get_personal_finance_feature_reply(user_message, user_state, include_sources
     if subscription_reply:
         return subscription_reply, (subscription_changed or True)
 
+    behavior_reply, behavior_changed = apply_behavior_budget_command(user_state, user_message)
+    if behavior_reply:
+        return behavior_reply, (behavior_changed or True)
+
     # Proactive decay alert for finance-oriented prompts.
     if any(marker in normalized for marker in ["finance", "econom", "portfolio", "stock", "market"]):
-        alert = build_subscription_decay_report(user_state, include_sources=include_sources)
-        if alert and "No subscriptions tracked" not in alert:
-            return alert, True
+        alert_parts = []
+        sub_alert = build_subscription_decay_report(user_state, include_sources=include_sources)
+        if sub_alert and "No subscriptions tracked" not in sub_alert:
+            alert_parts.append(sub_alert)
+        coach_nudge = build_empathetic_budget_nudge(user_state)
+        if coach_nudge:
+            alert_parts.append(coach_nudge)
+        if alert_parts:
+            return "\n\n".join(alert_parts), True
 
     return "", False
+
+
+def maybe_generate_daily_finance_alert(user_state):
+    """Generate one proactive daily alert for finance coaching on session open."""
+    user_state = ensure_finance_profiles(user_state)
+    behavior_profile = user_state.get("behavior_budget_profile") or {}
+    today = datetime.now().strftime("%Y-%m-%d")
+    last_date = (behavior_profile.get("last_daily_alert_date") or "")[:10]
+    if last_date == today:
+        return "", False
+
+    parts = []
+    nudge = build_empathetic_budget_nudge(user_state)
+    if nudge:
+        parts.append(nudge)
+
+    sub_alert = build_subscription_decay_report(user_state)
+    if sub_alert and "No subscriptions tracked" not in sub_alert:
+        lines = sub_alert.splitlines()
+        short = "\n".join(lines[:4])
+        parts.append(short)
+
+    if not parts:
+        return "", False
+
+    behavior_profile["last_daily_alert_date"] = today
+    behavior_profile["last_coach_alert_at"] = utc_now_iso()
+    user_state["behavior_budget_profile"] = behavior_profile
+    return "\n\n".join(parts), True
+
+
+def pdf_escape_text(value):
+    """Escape text for a basic PDF content stream."""
+    raw = (value or "").replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    return re.sub(r"[^\x20-\x7E]", "?", raw)
+
+
+def build_simple_pdf_from_lines(lines, title="Weekly Finance Report"):
+    """Build a small one-page PDF from plain text lines without external deps."""
+    sanitized_lines = [pdf_escape_text(title), ""] + [pdf_escape_text(line) for line in lines]
+    y_start = 780
+    line_height = 14
+
+    content = ["BT", "/F1 11 Tf", f"50 {y_start} Td"]
+    for idx, line in enumerate(sanitized_lines[:45]):
+        if idx > 0:
+            content.append(f"0 -{line_height} Td")
+        content.append(f"({line[:110]}) Tj")
+    content.append("ET")
+    stream_text = "\n".join(content)
+    stream_bytes = stream_text.encode("latin-1", errors="replace")
+
+    objects = []
+    objects.append(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+    objects.append(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
+    objects.append(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n"
+    )
+    objects.append(b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n")
+    objects.append(
+        b"5 0 obj\n<< /Length " + str(len(stream_bytes)).encode("ascii") + b" >>\nstream\n" + stream_bytes + b"\nendstream\nendobj\n"
+    )
+
+    header = b"%PDF-1.4\n"
+    body = b""
+    offsets = [0]
+    current_offset = len(header)
+    for obj in objects:
+        offsets.append(current_offset)
+        body += obj
+        current_offset += len(obj)
+
+    xref_start = len(header) + len(body)
+    xref = [f"xref\n0 {len(objects) + 1}\n".encode("ascii")]
+    xref.append(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        xref.append(f"{offset:010d} 00000 n \n".encode("ascii"))
+
+    trailer = (
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref_start}\n%%EOF\n"
+    ).encode("ascii")
+
+    return header + body + b"".join(xref) + trailer
+
+
+def build_weekly_finance_report_lines(user_state):
+    """Build weekly report lines from watchlist, subscriptions, and behavior."""
+    user_state = ensure_finance_profiles(user_state)
+    finance_profile = user_state.get("finance_profile") or {}
+    subscription_profile = user_state.get("subscription_profile") or {}
+
+    lines = [f"Generated: {utc_now_iso()}"]
+
+    watchlist = finance_profile.get("watchlist") or []
+    lines.append("")
+    lines.append("Watchlist")
+    if watchlist:
+        try:
+            quotes, _source_url = fetch_live_quotes(watchlist)
+        except Exception:
+            quotes = {}
+        for symbol in watchlist:
+            quote = quotes.get(symbol) or {}
+            price = quote.get("price")
+            change = quote.get("change_percent")
+            if price is None:
+                lines.append(f"- {symbol}: unavailable")
+                continue
+            change_text = f"{change:+.2f}%" if isinstance(change, (int, float)) else "n/a"
+            lines.append(f"- {symbol}: ${float(price):.2f} ({change_text})")
+    else:
+        lines.append("- No watchlist symbols configured.")
+
+    lines.append("")
+    lines.append("Subscriptions")
+    items = subscription_profile.get("items") or []
+    if items:
+        total = sum(float(i.get("monthly_cost") or 0.0) for i in items)
+        lines.append(f"- Monthly cost total: ${total:.2f}")
+        for item in items[:12]:
+            lines.append(
+                f"- {item.get('name')}: ${float(item.get('monthly_cost') or 0.0):.2f}/mo | unused {int(item.get('days_since_last_use') or 0)}d"
+            )
+    else:
+        lines.append("- No subscriptions configured.")
+
+    lines.append("")
+    lines.append("Behavioral Psychology Budgeting")
+    insight_text = build_behavioral_budget_summary(user_state)
+    for line in insight_text.splitlines():
+        lines.append(f"- {line}" if not line.startswith("-") else line)
+
+    nudge = build_empathetic_budget_nudge(user_state)
+    if nudge:
+        lines.append("")
+        lines.append("Coach Nudge")
+        lines.append(f"- {nudge}")
+
+    return lines
 
 
 def extract_country_from_text(normalized_text):
@@ -4130,6 +4584,9 @@ async function ensureRegistration() {
             if (meData.name) {
                 addMessage('bot', `welcome back, ${meData.name}.`);
             }
+            if (meData.daily_finance_alert) {
+                addMessage('bot', meData.daily_finance_alert);
+            }
             return true;
         }
     } catch (_) {}
@@ -4363,12 +4820,16 @@ def api_auth_me():
     user_id = resolve_session_user_id()
     if not user_id:
         return jsonify({"authenticated": False}), 401
-    user_state = load_user_state(user_id)
+    user_state = ensure_finance_profiles(load_user_state(user_id))
+    daily_alert, updated = maybe_generate_daily_finance_alert(user_state)
+    if updated:
+        save_user_state(user_id, user_state)
     profile = user_state.get("profile") or {}
     return jsonify({
         "authenticated": True,
         "user_id": user_id,
         "name": profile.get("name") or "",
+        "daily_finance_alert": daily_alert,
     })
 
 
@@ -4638,6 +5099,74 @@ def api_finance_alerts():
         "as_of_utc": utc_now_iso(),
         "alert": report_text,
     })
+
+
+@app.route("/api/finance/behavior", methods=["GET", "POST"])
+def api_finance_behavior():
+    """Get behavior insights or log spend events for trigger learning."""
+    mark_user_activity()
+    session_user_id = resolve_session_user_id()
+    user_id = sanitize_user_id(session_user_id or request.args.get("user_id") or DEFAULT_USER_ID)
+    user_state = ensure_finance_profiles(load_user_state(user_id))
+
+    if request.method == "GET":
+        insight_text = build_behavioral_budget_summary(user_state)
+        nudge = build_empathetic_budget_nudge(user_state)
+        return jsonify({
+            "user_id": user_id,
+            "insights": insight_text,
+            "nudge": nudge,
+            "as_of_utc": utc_now_iso(),
+        })
+
+    if reject_large_request(8192):
+        return jsonify({"error": "Payload too large."}), 413
+    data = request.get_json(silent=True) or {}
+    amount = data.get("amount")
+    category = (data.get("category") or "other").strip().lower()
+    day_of_week = (data.get("day_of_week") or datetime.now().strftime("%A")).strip().capitalize()
+    hour = data.get("hour") if data.get("hour") is not None else datetime.now().hour
+    stress_level = (data.get("stress_level") or "medium").strip().lower()
+
+    try:
+        amount_value = float(amount)
+    except Exception:
+        return jsonify({"error": "amount must be numeric."}), 400
+    try:
+        hour_value = int(hour)
+    except Exception:
+        hour_value = datetime.now().hour
+    if amount_value <= 0:
+        return jsonify({"error": "amount must be > 0."}), 400
+    if stress_level not in {"low", "medium", "high"}:
+        stress_level = "medium"
+
+    event = {
+        "amount": amount_value,
+        "category": category or "other",
+        "day_of_week": day_of_week,
+        "hour": max(0, min(23, hour_value)),
+        "stress_level": stress_level,
+        "timestamp": utc_now_iso(),
+    }
+    user_state = add_spend_event(user_state, event)
+    save_user_state(user_id, user_state)
+    return jsonify({"status": "ok", "user_id": user_id, "event": event})
+
+
+@app.route("/api/finance/reports/weekly.pdf", methods=["GET"])
+def api_finance_weekly_pdf():
+    """Generate a downloadable weekly finance PDF report."""
+    mark_user_activity()
+    session_user_id = resolve_session_user_id()
+    user_id = sanitize_user_id(session_user_id or request.args.get("user_id") or DEFAULT_USER_ID)
+    user_state = ensure_finance_profiles(load_user_state(user_id))
+    lines = build_weekly_finance_report_lines(user_state)
+    pdf_bytes = build_simple_pdf_from_lines(lines, title="Weekly Finance Report")
+    response = app.response_class(pdf_bytes, mimetype="application/pdf")
+    response.headers["Content-Disposition"] = "attachment; filename=weekly_finance_report.pdf"
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route("/IMG_9664.jpeg")
