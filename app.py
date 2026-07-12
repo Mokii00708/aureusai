@@ -65,6 +65,11 @@ auth_rate_limit_hits = {}
 analytics_db_lock = threading.Lock()
 finance_cache_lock = threading.Lock()
 finance_quote_cache = {}
+finance_provider_health = {
+    "yahoo": {"last_attempt": "", "last_success": "", "last_error": "", "success_count": 0, "error_count": 0},
+    "stooq": {"last_attempt": "", "last_success": "", "last_error": "", "success_count": 0, "error_count": 0},
+    "alpha_vantage": {"last_attempt": "", "last_success": "", "last_error": "", "success_count": 0, "error_count": 0},
+}
 FINANCE_QUOTE_CACHE_TTL_SECONDS = int(os.getenv("FINANCE_QUOTE_CACHE_TTL_SECONDS", "60"))
 ALPHA_VANTAGE_API_KEY = (os.getenv("ALPHA_VANTAGE_API_KEY") or "").strip()
 HOME_COUNTRY = (os.getenv("HOME_COUNTRY") or "United States").strip()
@@ -112,6 +117,7 @@ COMPANY_ALIAS_TO_TICKER = {
     "disney": "DIS",
     "pepsi": "PEP",
 }
+KNOWN_TICKERS = sorted(set(COMPANY_ALIAS_TO_TICKER.values()))
 
 SYSTEM_PROMPT = """You are a warm, intelligent, and engaging conversational AI designed for meaningful chat. 
 You are helpful, thoughtful, and genuinely interested in the person you're talking with. 
@@ -1792,6 +1798,13 @@ def extract_ticker_candidates(text):
         if alias in lower:
             found.add(ticker)
 
+    # Accept lowercase ticker words when query context implies quote lookup.
+    if any(k in lower for k in ["stock", "stocks", "share", "shares", "quote", "price", "actions"]):
+        for token in re.findall(r"\b[a-z]{1,5}(?:\.[a-z]{1,2})?\b", lower):
+            maybe = normalize_ticker_symbol(token)
+            if maybe and maybe in KNOWN_TICKERS:
+                found.add(maybe)
+
     return sorted(found)
 
 
@@ -1855,6 +1868,30 @@ def to_float_or_none(value):
         return float(str(value).replace(",", "").strip())
     except Exception:
         return None
+
+
+def mark_quote_provider_attempt(provider):
+    """Update provider health metrics for an attempt."""
+    with finance_cache_lock:
+        bucket = finance_provider_health.setdefault(provider, {})
+        bucket["last_attempt"] = utc_now_iso()
+
+
+def mark_quote_provider_success(provider):
+    """Update provider health metrics for a successful response."""
+    with finance_cache_lock:
+        bucket = finance_provider_health.setdefault(provider, {})
+        bucket["last_success"] = utc_now_iso()
+        bucket["last_error"] = ""
+        bucket["success_count"] = int(bucket.get("success_count", 0)) + 1
+
+
+def mark_quote_provider_error(provider, err):
+    """Update provider health metrics for a failed response."""
+    with finance_cache_lock:
+        bucket = finance_provider_health.setdefault(provider, {})
+        bucket["last_error"] = (str(err) or "error")[:300]
+        bucket["error_count"] = int(bucket.get("error_count", 0)) + 1
 
 
 def fetch_yahoo_quotes(symbols):
@@ -2020,17 +2057,21 @@ def fetch_live_quotes(symbols):
         remaining = list(missing)
 
         # Provider 1: Yahoo Finance
+        mark_quote_provider_attempt("yahoo")
         try:
             yahoo_quotes, yahoo_source = fetch_yahoo_quotes(remaining)
             if yahoo_source:
                 used_sources.append(yahoo_source)
             quotes.update(yahoo_quotes)
-        except Exception:
-            pass
+            if yahoo_quotes:
+                mark_quote_provider_success("yahoo")
+        except Exception as e:
+            mark_quote_provider_error("yahoo", e)
         remaining = [s for s in remaining if s not in quotes]
 
         # Provider 2: Stooq fallback
         if remaining:
+            mark_quote_provider_attempt("stooq")
             try:
                 stooq_quotes, stooq_source = fetch_stooq_quotes(remaining)
                 if stooq_source:
@@ -2038,12 +2079,15 @@ def fetch_live_quotes(symbols):
                 for symbol, quote in stooq_quotes.items():
                     if symbol not in quotes:
                         quotes[symbol] = quote
-            except Exception:
-                pass
+                if stooq_quotes:
+                    mark_quote_provider_success("stooq")
+            except Exception as e:
+                mark_quote_provider_error("stooq", e)
         remaining = [s for s in remaining if s not in quotes]
 
         # Provider 3: Alpha Vantage fallback (optional API key)
         if remaining and ALPHA_VANTAGE_API_KEY:
+            mark_quote_provider_attempt("alpha_vantage")
             try:
                 av_quotes, av_source = fetch_alpha_vantage_quotes(remaining)
                 if av_source:
@@ -2051,8 +2095,10 @@ def fetch_live_quotes(symbols):
                 for symbol, quote in av_quotes.items():
                     if symbol not in quotes:
                         quotes[symbol] = quote
-            except Exception:
-                pass
+                if av_quotes:
+                    mark_quote_provider_success("alpha_vantage")
+            except Exception as e:
+                mark_quote_provider_error("alpha_vantage", e)
 
         now_cached_at = time.time()
         with finance_cache_lock:
@@ -2071,7 +2117,17 @@ def fetch_live_quotes(symbols):
             with finance_cache_lock:
                 cached = finance_quote_cache.get(symbol)
             if cached:
-                quotes[symbol] = cached.get("quote") or {}
+                recovered = dict(cached.get("quote") or {})
+                cached_at = float(cached.get("cached_at") or 0.0)
+                recovered["stale"] = True
+                recovered["cache_age_seconds"] = max(0.0, time.time() - cached_at) if cached_at else None
+                recovered["last_known_utc"] = datetime.fromtimestamp(cached_at, tz=timezone.utc).isoformat() if cached_at else ""
+                quotes[symbol] = recovered
+
+    # Mark non-stale quotes when freshly fetched.
+    for symbol, quote in quotes.items():
+        if "stale" not in quote:
+            quote["stale"] = False
 
     return quotes, source_url
 
@@ -2352,9 +2408,20 @@ def get_live_quote_reply(normalized_text, original_text, include_sources=False):
         change_text = f"{change_pct:+.2f}%" if isinstance(change_pct, (int, float)) else "n/a"
         market_ts_text = format_quote_timestamp(quote.get("market_time"))
         exchange_part = f" on {exchange}" if exchange else ""
-        lines.append(
-            f"- {symbol} ({name}): {price:.2f} {currency}{exchange_part} | change {change_text} | as of {market_ts_text}"
-        )
+        provider = (quote.get("provider") or "unknown").replace("_", " ")
+        stale = bool(quote.get("stale"))
+        if stale:
+            last_known = quote.get("last_known_utc") or "unknown"
+            age = quote.get("cache_age_seconds")
+            age_text = f"{int(age)}s" if isinstance(age, (int, float)) else "unknown"
+            lines.append(
+                f"- {symbol} ({name}): last known {price:.2f} {currency}{exchange_part} | change {change_text} | "
+                f"market as of {market_ts_text} | cached at {last_known} ({age_text} ago) | provider {provider}"
+            )
+        else:
+            lines.append(
+                f"- {symbol} ({name}): {price:.2f} {currency}{exchange_part} | change {change_text} | as of {market_ts_text} | provider {provider}"
+            )
 
     lines.append("If you want, I can keep tracking a watchlist and compare updates minute by minute.")
     sources = [source_url] if source_url else ["https://finance.yahoo.com/"]
@@ -6170,6 +6237,10 @@ def api_finance_quotes():
             "change_percent": quote.get("change_percent"),
             "market_time": quote.get("market_time"),
             "market_time_utc": format_quote_timestamp(quote.get("market_time")),
+            "provider": quote.get("provider") or "unknown",
+            "stale": bool(quote.get("stale")),
+            "cache_age_seconds": quote.get("cache_age_seconds"),
+            "last_known_utc": quote.get("last_known_utc") or "",
         })
 
     return jsonify({
@@ -6211,10 +6282,30 @@ def api_finance_watchlist():
                     "change_percent": (quotes_map.get(symbol) or {}).get("change_percent"),
                     "market_time": (quotes_map.get(symbol) or {}).get("market_time"),
                     "market_time_utc": format_quote_timestamp((quotes_map.get(symbol) or {}).get("market_time")),
+                    "provider": (quotes_map.get(symbol) or {}).get("provider") or "unknown",
+                    "stale": bool((quotes_map.get(symbol) or {}).get("stale")),
+                    "cache_age_seconds": (quotes_map.get(symbol) or {}).get("cache_age_seconds"),
+                    "last_known_utc": (quotes_map.get(symbol) or {}).get("last_known_utc") or "",
                 }
                 for symbol in watchlist
             ]
         return jsonify(response)
+
+
+@app.route("/api/finance/providers/health", methods=["GET"])
+def api_finance_provider_health():
+    """Return quote provider health diagnostics and cache stats."""
+    mark_user_activity()
+    with finance_cache_lock:
+        health = json.loads(json.dumps(finance_provider_health))
+        cache_size = len(finance_quote_cache)
+    return jsonify({
+        "as_of_utc": utc_now_iso(),
+        "cache_ttl_seconds": FINANCE_QUOTE_CACHE_TTL_SECONDS,
+        "cache_size": cache_size,
+        "alpha_vantage_configured": bool(ALPHA_VANTAGE_API_KEY),
+        "providers": health,
+    })
 
     if reject_large_request(8192):
         return jsonify({"error": "Payload too large."}), 413
