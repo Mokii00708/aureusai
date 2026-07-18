@@ -4489,6 +4489,10 @@ def fetch_twelvedata_quotes(symbols):
             except Exception:
                 pass
 
+            if market_time is None:
+                # Keep price traceable even when quote endpoint omits datetime for demo/limited plans.
+                market_time = int(time.time())
+
             quotes[normalized] = {
                 "symbol": normalized,
                 "name": normalized,
@@ -4503,7 +4507,7 @@ def fetch_twelvedata_quotes(symbols):
                 "source_url": price_url,
                 "price_source_field": "price",
                 "change_percent_source_field": "quote.percent_change",
-                "market_time_source_field": "quote.datetime",
+                "market_time_source_field": "quote.datetime|local_fetch_utc_fallback",
             }
         except Exception:
             continue
