@@ -65,6 +65,10 @@ DB_POOL_RECYCLE_SECONDS = int(os.getenv("DB_POOL_RECYCLE_SECONDS", "1800"))
 LLM_REQUEST_TIMEOUT_SECONDS = float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "25"))
 DATA_UNAVAILABLE_RETRY_MESSAGE = "Data unavailable right now. Please try again in a moment."
 MARKET_DATA_UNAVAILABLE_RETRY_MESSAGE = "Market data unavailable right now. Please try again in a moment."
+UNVERIFIED_FINANCIAL_CLAIM_MESSAGE = (
+    "I cannot verify numeric financial figures for this request from live/cached sources right now. "
+    "Please retry or ask for an assumption-based estimate explicitly."
+)
 DEFAULT_USER_ID = "guest"
 APP_SECRET = os.getenv("APP_SECRET") or API_KEY
 ACCESS_TOKEN_TTL_SECONDS = min(86400, int(os.getenv("ACCESS_TOKEN_TTL_SECONDS", "3600")))
@@ -259,16 +263,11 @@ COMPANY_ALIAS_TO_TICKER = {
 }
 KNOWN_TICKERS = sorted(set(COMPANY_ALIAS_TO_TICKER.values()))
 
-MOCK_FUNDAMENTALS_BY_TICKER = {
-    "TSLA": {"pe_ratio": 59.0, "net_profit_margin": 8.2, "debt_to_equity": 0.18, "roe": 19.4},
-    "F": {"pe_ratio": 7.4, "net_profit_margin": 2.9, "debt_to_equity": 2.45, "roe": 15.3},
-    "GM": {"pe_ratio": 5.7, "net_profit_margin": 6.1, "debt_to_equity": 1.72, "roe": 17.0},
-    "AAPL": {"pe_ratio": 29.8, "net_profit_margin": 25.2, "debt_to_equity": 1.56, "roe": 149.0},
-    "MSFT": {"pe_ratio": 35.4, "net_profit_margin": 35.1, "debt_to_equity": 0.33, "roe": 38.0},
-    "GOOGL": {"pe_ratio": 25.9, "net_profit_margin": 24.5, "debt_to_equity": 0.09, "roe": 30.3},
-    "AMZN": {"pe_ratio": 44.2, "net_profit_margin": 8.0, "debt_to_equity": 0.52, "roe": 21.4},
-    "META": {"pe_ratio": 27.1, "net_profit_margin": 30.4, "debt_to_equity": 0.19, "roe": 34.8},
-    "NVDA": {"pe_ratio": 63.0, "net_profit_margin": 49.1, "debt_to_equity": 0.24, "roe": 79.8},
+NON_PUBLIC_COMPARISON_ALIASES = {
+    "fidelity",
+    "vanguard",
+    "blackrock",
+    "t rowe price",
 }
 
 SYSTEM_PROMPT = """You are Nudge: a direct, fiercely loyal, opinionated financial coach.
@@ -2087,6 +2086,57 @@ def localize_reply(reply_text, target_lang):
         return reply_text
     return translate_text(reply_text, "mn")
 
+
+def is_finance_numeric_sensitive_query(text):
+    """Return True when user query is likely to request financial numeric claims."""
+    lowered = normalize_case(text or "")
+    markers = [
+        "stock", "stocks", "ticker", "quote", "price", "market cap", "portfolio", "invest", "investment",
+        "hysa", "savings", "return", "roi", "pe", "p/e", "roe", "debt to equity", "margin", "finance",
+        "etf", "fund", "interest rate", "yield",
+    ]
+    return any(marker in lowered for marker in markers)
+
+
+def response_has_financial_numeric_claim(text):
+    """Detect likely numeric financial claims in free-form assistant text."""
+    body = text or ""
+    has_number = bool(re.search(r"\d", body))
+    if not has_number:
+        return False
+    finance_tokens = bool(
+        re.search(
+            r"(?i)(\$|usd|eur|gbp|%|p/e|pe\b|roe\b|debt[-\s]*to[-\s]*equity|margin|market\s*cap|yield|annual\s*return|price)",
+            body,
+        )
+    )
+    return finance_tokens
+
+
+def apply_financial_traceability_guard(user_message, assistant_message, source_tag="llm", user_id=DEFAULT_USER_ID):
+    """Block untraceable numeric finance claims from generative responses."""
+    msg = assistant_message or ""
+    if not is_finance_numeric_sensitive_query(user_message):
+        return msg
+    if not response_has_financial_numeric_claim(msg):
+        return msg
+
+    # Allow explicitly assumption-labeled outputs.
+    if re.search(r"(?i)assumption|illustrative|example\s+only|not\s+guaranteed", msg):
+        return msg
+
+    log_metric_validation_block(
+        "global-finance-reply",
+        "untraceable-numeric-claim",
+        {
+            "source_tag": source_tag,
+            "user_message": (user_message or "")[:240],
+            "assistant_preview": msg[:240],
+        },
+        user_id=user_id,
+    )
+    return UNVERIFIED_FINANCIAL_CLAIM_MESSAGE
+
 def get_ai_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True):
     """Send user message to frontier model and stream response."""
     global conversation_history
@@ -2180,6 +2230,7 @@ def get_ai_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True
         print()  # Newline after streaming completes
         full_response = apply_tone_style(full_response, user_message)
         full_response = merge_witty_alert(full_response, subscription_alert)
+        full_response = apply_financial_traceability_guard(user_message, full_response, source_tag="llm-stream", user_id=user_id)
         
         # Append complete assistant response to history
         conversation_history.append({"role": "assistant", "content": full_response})
@@ -2200,6 +2251,7 @@ def get_ai_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True
             assistant_message = DATA_UNAVAILABLE_RETRY_MESSAGE
         assistant_message = apply_tone_style(assistant_message, user_message)
         assistant_message = merge_witty_alert(assistant_message, subscription_alert)
+        assistant_message = apply_financial_traceability_guard(user_message, assistant_message, source_tag="local-fallback", user_id=user_id)
         conversation_history.append({"role": "assistant", "content": assistant_message})
         save_history(conversation_history)
         if remember_history:
@@ -2329,6 +2381,7 @@ def get_ai_response_sync(user_message, user_id=DEFAULT_USER_ID, remember_history
         assistant_message = apply_tone_style(assistant_message, user_message)
         assistant_message = localize_reply(assistant_message, target_language)
         assistant_message = merge_witty_alert(assistant_message, subscription_alert)
+        assistant_message = apply_financial_traceability_guard(user_message, assistant_message, source_tag="llm-sync", user_id=user_id)
 
         conversation_history.append({"role": "assistant", "content": assistant_message})
         save_history(conversation_history)
@@ -2346,6 +2399,7 @@ def get_ai_response_sync(user_message, user_id=DEFAULT_USER_ID, remember_history
         assistant_message = apply_tone_style(assistant_message, user_message)
         assistant_message = localize_reply(assistant_message, target_language)
         assistant_message = merge_witty_alert(assistant_message, subscription_alert)
+        assistant_message = apply_financial_traceability_guard(user_message, assistant_message, source_tag="local-sync-fallback", user_id=user_id)
         conversation_history.append({"role": "assistant", "content": assistant_message})
         save_history(conversation_history)
         if remember_history:
@@ -2876,55 +2930,178 @@ def parse_comparison_targets(message):
     return deduped[:4] if len(deduped) >= 2 else []
 
 
-def _fallback_mock_fundamentals(symbol):
-    """Create deterministic mock fundamentals when no curated metric is available."""
-    seed = sum(ord(ch) for ch in (symbol or "UNKNOWN"))
+def log_metric_validation_block(event, reason, details=None, user_id=None):
+    """Audit blocked financial metric responses to prevent fabricated output."""
+    payload = {
+        "event": event,
+        "reason": reason,
+        "details": details or {},
+        "user_id": sanitize_user_id(user_id or DEFAULT_USER_ID),
+        "ts": utc_now_iso(),
+    }
+    print(f"[metric-validation-blocked] {json.dumps(payload, ensure_ascii=True)}")
+    try:
+        audit_user_id = sanitize_user_id(user_id or DEFAULT_USER_ID)
+        user_state = ensure_finance_profiles(load_user_state(audit_user_id))
+        finance_profile = user_state.get("finance_profile") or {}
+        history = finance_profile.get("metric_validation_history")
+        if not isinstance(history, list):
+            history = []
+        history.append(
+            {
+                "event": str(event or "unknown"),
+                "reason": str(reason or "unknown"),
+                "details": details or {},
+                "created_at": payload["ts"],
+            }
+        )
+        finance_profile["metric_validation_history"] = history[-200:]
+        user_state["finance_profile"] = finance_profile
+        save_user_state(audit_user_id, user_state)
+    except Exception:
+        pass
+
+
+def is_non_public_comparison_target(raw_name):
+    """Detect common non-public institutions for stock-style comparison guardrails."""
+    return normalize_case(raw_name or "") in NON_PUBLIC_COMPARISON_ALIASES
+
+
+def resolve_public_equity_symbol(raw_name):
+    """Resolve target to a public-equity symbol only (not ETF/mutual-fund/platform)."""
+    raw = (raw_name or "").strip()
+    if not raw:
+        return {"ok": False, "reason": "empty-target"}
+    if is_non_public_comparison_target(raw):
+        return {"ok": False, "reason": "non-public-firm"}
+
+    candidate = normalize_ticker_symbol(raw)
+    if not candidate:
+        candidate = COMPANY_ALIAS_TO_TICKER.get(normalize_case(raw)) or ""
+
+    if candidate:
+        quote_payload = fetch_json_url(
+            f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={quote_plus(candidate)}"
+        )
+        result = ((quote_payload.get("quoteResponse") or {}).get("result") or [])
+        if result:
+            qtype = (result[0].get("quoteType") or "").upper()
+            if qtype == "EQUITY":
+                return {"ok": True, "symbol": candidate}
+
+    search_payload = fetch_json_url(
+        f"https://query1.finance.yahoo.com/v1/finance/search?q={quote_plus(raw)}"
+    )
+    for item in (search_payload.get("quotes") or []):
+        qtype = (item.get("quoteType") or "").upper()
+        symbol = normalize_ticker_symbol(item.get("symbol") or "")
+        if symbol and qtype == "EQUITY":
+            return {"ok": True, "symbol": symbol}
+
+    return {"ok": False, "reason": "not-public-equity"}
+
+
+def to_traceable_metric(value, source_field, source_url="", request_trace_id=""):
+    """Attach source lineage to numeric metric values."""
+    numeric = to_float_or_none(value)
+    if numeric is None:
+        return None
     return {
-        "pe_ratio": round(10.0 + (seed % 450) / 10.0, 1),
-        "net_profit_margin": round(2.0 + ((seed // 3) % 280) / 10.0, 1),
-        "debt_to_equity": round(0.05 + ((seed // 7) % 300) / 100.0, 2),
-        "roe": round(4.0 + ((seed // 5) % 360) / 10.0, 1),
+        "value": float(numeric),
+        "source": source_field,
+        "source_url": str(source_url or ""),
+        "request_trace_id": str(request_trace_id or ""),
     }
 
 
-def get_comparison_data(firms):
-    """Aggregate valuation/profitability/solvency/efficiency metrics for target firms."""
+def normalize_ratio_to_percent(raw_value):
+    """Normalize API ratio values into percent scale for user display."""
+    numeric = to_float_or_none(raw_value)
+    if numeric is None:
+        return None
+    if -1.0 <= numeric <= 1.0:
+        return numeric * 100.0
+    return numeric
+
+
+def get_comparison_data(firms, request_trace_id=""):
+    """Aggregate only traceable API-sourced fundamentals for public equities."""
     entries = []
-    symbols = []
+    blocked = []
+    seen_symbols = set()
+
     for firm in firms or []:
         raw = (firm or "").strip()
         if not raw:
             continue
-        symbol = normalize_ticker_symbol(raw)
-        if not symbol:
-            symbol = COMPANY_ALIAS_TO_TICKER.get(normalize_case(raw)) or resolve_ticker_from_company_name(raw)
-        if not symbol:
+        resolved = resolve_public_equity_symbol(raw)
+        if not resolved.get("ok"):
+            blocked.append({"target": raw, "reason": resolved.get("reason") or "unresolved"})
             continue
-        if symbol in symbols:
+        symbol = normalize_ticker_symbol(resolved.get("symbol") or "")
+        if not symbol or symbol in seen_symbols:
             continue
-        symbols.append(symbol)
+        seen_symbols.add(symbol)
         entries.append({"input": raw, "symbol": symbol})
         if len(entries) >= 4:
             break
 
     if len(entries) < 2:
-        return {}
+        return {}, blocked
 
-    quotes, _source_url = fetch_live_quotes([e["symbol"] for e in entries])
+    symbols = [entry["symbol"] for entry in entries]
+    quotes, source_url = fetch_yahoo_quotes(symbols)
     result = {}
     for entry in entries:
         symbol = entry["symbol"]
         quote = quotes.get(symbol) or {}
-        fundamentals = MOCK_FUNDAMENTALS_BY_TICKER.get(symbol) or _fallback_mock_fundamentals(symbol)
+
+        quote_type = (quote.get("quote_type") or "").upper()
+        if quote_type and quote_type != "EQUITY":
+            blocked.append({"target": entry["input"], "reason": f"non-equity-type:{quote_type}"})
+            continue
+
+        metrics = {
+            "pe_ratio": to_traceable_metric(
+                quote.get("trailing_pe"),
+                "yahoo.v7.quote.trailingPE",
+                source_url=source_url,
+                request_trace_id=request_trace_id,
+            ),
+            "net_profit_margin": to_traceable_metric(
+                normalize_ratio_to_percent(quote.get("profit_margins")),
+                "yahoo.v7.quote.profitMargins",
+                source_url=source_url,
+                request_trace_id=request_trace_id,
+            ),
+            "debt_to_equity": to_traceable_metric(
+                quote.get("debt_to_equity"),
+                "yahoo.v7.quote.debtToEquity",
+                source_url=source_url,
+                request_trace_id=request_trace_id,
+            ),
+            "roe": to_traceable_metric(
+                normalize_ratio_to_percent(quote.get("return_on_equity")),
+                "yahoo.v7.quote.returnOnEquity",
+                source_url=source_url,
+                request_trace_id=request_trace_id,
+            ),
+        }
+        if sum(1 for value in metrics.values() if value is not None) == 0:
+            blocked.append({"target": entry["input"], "reason": "no-traceable-fundamentals"})
+            continue
+
         result[symbol] = {
             "firm": symbol,
             "display_name": quote.get("name") or symbol,
-            "pe_ratio": float(fundamentals.get("pe_ratio") or 0.0),
-            "net_profit_margin": float(fundamentals.get("net_profit_margin") or 0.0),
-            "debt_to_equity": float(fundamentals.get("debt_to_equity") or 0.0),
-            "roe": float(fundamentals.get("roe") or 0.0),
+            "metrics": metrics,
+            "input": entry["input"],
+            "source": "yahoo.v7.quote",
+            "source_url": source_url,
+            "request_trace_id": request_trace_id,
         }
-    return result
+
+    return result, blocked
 
 
 def detect_comparison_priority(message):
@@ -2942,25 +3119,47 @@ def detect_comparison_priority(message):
 
 
 def build_comparison_markdown_table(comparison_data):
-    """Render side-by-side firm comparison as a compact Markdown table."""
+    """Render side-by-side firm comparison from traceable metrics only."""
     rows = [
         "| Firm | P/E Ratio | Net Profit Margin | Debt-to-Equity | ROE |",
         "| --- | ---: | ---: | ---: | ---: |",
     ]
+
+    def metric_text(data, key, suffix=""):
+        metric = ((data.get("metrics") or {}).get(key) if isinstance(data, dict) else None)
+        if not metric:
+            return "n/a"
+        value = to_float_or_none(metric.get("value"))
+        if value is None:
+            return "n/a"
+        if key == "debt_to_equity":
+            return f"{value:.2f}{suffix}"
+        return f"{value:.1f}{suffix}"
+
     for symbol, data in comparison_data.items():
         rows.append(
-            f"| {symbol} | {data['pe_ratio']:.1f} | {data['net_profit_margin']:.1f}% | {data['debt_to_equity']:.2f} | {data['roe']:.1f}% |"
+            f"| {symbol} | {metric_text(data, 'pe_ratio')} | {metric_text(data, 'net_profit_margin', '%')} | {metric_text(data, 'debt_to_equity')} | {metric_text(data, 'roe', '%')} |"
         )
     return "\n".join(rows)
 
 
 def build_coach_comparison_verdict(comparison_data, priority="balanced"):
-    """Generate priority-aligned verdict from comparison metrics."""
+    """Generate qualitative verdict using only available sourced metrics."""
     rows = list(comparison_data.values())
-    growth_pick = max(rows, key=lambda r: (r.get("roe", 0.0), r.get("net_profit_margin", 0.0)))
-    safety_pick = min(rows, key=lambda r: (r.get("debt_to_equity", 999.0), -r.get("net_profit_margin", 0.0)))
-    value_pick = min(rows, key=lambda r: (r.get("pe_ratio", 999.0), -r.get("net_profit_margin", 0.0)))
-    income_pick = max(rows, key=lambda r: (r.get("net_profit_margin", 0.0), -r.get("debt_to_equity", 999.0)))
+    if len(rows) < 2:
+        return "I could not build a valid sourced comparison for these targets."
+
+    def metric_value(row, key, fallback):
+        metric = ((row.get("metrics") or {}).get(key) if isinstance(row, dict) else None)
+        if not metric:
+            return fallback
+        value = to_float_or_none(metric.get("value"))
+        return fallback if value is None else float(value)
+
+    growth_pick = max(rows, key=lambda r: (metric_value(r, "roe", -9999.0), metric_value(r, "net_profit_margin", -9999.0)))
+    safety_pick = min(rows, key=lambda r: (metric_value(r, "debt_to_equity", 9999.0), -metric_value(r, "net_profit_margin", -9999.0)))
+    value_pick = min(rows, key=lambda r: (metric_value(r, "pe_ratio", 9999.0), -metric_value(r, "net_profit_margin", -9999.0)))
+    income_pick = max(rows, key=lambda r: (metric_value(r, "net_profit_margin", -9999.0), -metric_value(r, "debt_to_equity", 9999.0)))
 
     best_by_priority = {
         "growth": growth_pick,
@@ -2968,36 +3167,104 @@ def build_coach_comparison_verdict(comparison_data, priority="balanced"):
         "value": value_pick,
         "income": income_pick,
         "balanced": max(rows, key=lambda r: (
-            (r.get("roe", 0.0) * 0.45)
-            + (r.get("net_profit_margin", 0.0) * 0.35)
-            - (r.get("debt_to_equity", 0.0) * 10.0)
-            - (r.get("pe_ratio", 0.0) * 0.05)
+            (metric_value(r, "roe", 0.0) * 0.45)
+            + (metric_value(r, "net_profit_margin", 0.0) * 0.35)
+            - (metric_value(r, "debt_to_equity", 0.0) * 10.0)
+            - (metric_value(r, "pe_ratio", 0.0) * 0.05)
         )),
     }
     chosen_priority = priority if priority in best_by_priority else "balanced"
     best_pick = best_by_priority[chosen_priority]
-    return (
-        f"{best_pick['firm']} aligns best with {chosen_priority} priority. "
-        f"Quick context: ROE {best_pick['roe']:.1f}%, margin {best_pick['net_profit_margin']:.1f}%, "
-        f"D/E {best_pick['debt_to_equity']:.2f}, P/E {best_pick['pe_ratio']:.1f}."
-    )
+    return f"Based on currently sourced fundamentals, {best_pick['firm']} aligns best with your {chosen_priority} priority."
 
 
-def get_firm_comparison_reply(normalized_text, original_text, include_sources=False):
+def validate_traceable_comparison_metrics(comparison_data, request_trace_id=""):
+    """Ensure every emitted numeric metric can be traced to a request-time source."""
+    for symbol, row in (comparison_data or {}).items():
+        row_trace_id = str((row.get("request_trace_id") if isinstance(row, dict) else "") or "")
+        if request_trace_id and row_trace_id != request_trace_id:
+            return False, f"request-trace-mismatch:{symbol}"
+        metrics = row.get("metrics") if isinstance(row, dict) else None
+        if not isinstance(metrics, dict):
+            return False, f"missing-metrics:{symbol}"
+        for key, metric in metrics.items():
+            if metric is None:
+                continue
+            if not isinstance(metric, dict):
+                return False, f"invalid-metric-format:{symbol}:{key}"
+            if to_float_or_none(metric.get("value")) is None:
+                return False, f"invalid-metric-value:{symbol}:{key}"
+            if not (metric.get("source") or "").strip():
+                return False, f"missing-metric-source:{symbol}:{key}"
+            if not (metric.get("source_url") or "").strip():
+                return False, f"missing-metric-source-url:{symbol}:{key}"
+            metric_trace_id = str(metric.get("request_trace_id") or "")
+            if request_trace_id and metric_trace_id != request_trace_id:
+                return False, f"missing-or-mismatched-request-trace:{symbol}:{key}"
+    return True, ""
+
+
+def get_firm_comparison_reply(normalized_text, original_text, include_sources=False, user_id=DEFAULT_USER_ID):
     """Return deterministic side-by-side firm comparison table plus coach verdict."""
     targets = parse_comparison_targets(original_text)
     if len(targets) < 2:
         return ""
 
-    comparison_data = get_comparison_data(targets)
+    request_trace_id = f"cmp-{int(time.time() * 1000)}-{secrets.token_hex(3)}"
+    comparison_data, blocked = get_comparison_data(targets, request_trace_id=request_trace_id)
     if len(comparison_data) < 2:
-        return ""
+        target_text = ", ".join(targets)
+        non_public_targets = [row.get("target") for row in blocked if row.get("reason") in {"non-public-firm", "not-public-equity"}]
+        if non_public_targets:
+            return (
+                f"{', '.join(non_public_targets)} are not publicly traded operating companies, so stock metrics like P/E or ROE do not apply. "
+                "I do not currently have a reliable live source in this app for brokerage fee/account-structure comparison."
+            )
+        log_metric_validation_block(
+            "firm-comparison",
+            "insufficient-validated-targets",
+            {"targets": targets, "blocked": blocked, "request_trace_id": request_trace_id},
+            user_id=user_id,
+        )
+        return f"Data unavailable for a validated public-company comparison right now. Requested targets: {target_text}."
+
+    is_valid, reason = validate_traceable_comparison_metrics(comparison_data, request_trace_id=request_trace_id)
+    if not is_valid:
+        log_metric_validation_block(
+            "firm-comparison",
+            reason,
+            {"targets": targets, "request_trace_id": request_trace_id},
+            user_id=user_id,
+        )
+        return "Data unavailable for comparison right now because sourced financial metrics could not be validated."
+
+    if blocked:
+        log_metric_validation_block(
+            "firm-comparison",
+            "partial-targets-blocked",
+            {"targets": targets, "blocked": blocked, "request_trace_id": request_trace_id},
+            user_id=user_id,
+        )
 
     table = build_comparison_markdown_table(comparison_data)
+    if not table.strip():
+        log_metric_validation_block(
+            "firm-comparison",
+            "empty-comparison-table",
+            {"targets": targets, "request_trace_id": request_trace_id},
+            user_id=user_id,
+        )
+        return "Data unavailable for comparison right now because no traceable metrics were returned."
+
     priority = detect_comparison_priority(original_text)
     verdict = build_coach_comparison_verdict(comparison_data, priority=priority)
-    reply = f"{table}\n\n{verdict}"
-    return with_citations(reply, ["Mock fundamentals + cached quote context"], include_sources)
+    blocked_line = ""
+    if blocked:
+        blocked_targets = [row.get("target") for row in blocked if row.get("target")]
+        if blocked_targets:
+            blocked_line = f"\n\nExcluded targets (not validated public-equity comparisons): {', '.join(blocked_targets)}."
+    reply = f"{table}\n\n{verdict}{blocked_line}"
+    return with_citations(reply, ["https://query1.finance.yahoo.com/v7/finance/quote"], include_sources)
 
 
 def to_float_or_none(value):
@@ -3646,7 +3913,7 @@ def render_dynamic_opportunity_cost_projection(projection):
     if not parts:
         return ""
     return (
-        f"If invested in a simple index fund at {rate_pct:.1f}% instead, this could grow to "
+        f"Assumption-based projection (illustrative, not guaranteed): if invested in a simple index fund at an assumed {rate_pct:.1f}% annual return, this could grow to "
         + ", ".join(parts)
         + "."
     )
@@ -3700,7 +3967,16 @@ def fetch_yahoo_quotes(symbols):
             "market_time": item.get("regularMarketTime"),
             "beta": item.get("beta"),
             "market_cap": item.get("marketCap"),
+            "quote_type": item.get("quoteType") or "",
+            "trailing_pe": item.get("trailingPE"),
+            "profit_margins": item.get("profitMargins"),
+            "debt_to_equity": item.get("debtToEquity"),
+            "return_on_equity": item.get("returnOnEquity"),
             "provider": "yahoo",
+            "source_url": source_url,
+            "price_source_field": "regularMarketPrice",
+            "change_percent_source_field": "regularMarketChangePercent",
+            "market_time_source_field": "regularMarketTime",
         }
     return quotes, source_url
 
@@ -3760,6 +4036,10 @@ def fetch_stooq_quotes(symbols):
             "beta": None,
             "market_cap": None,
             "provider": "stooq",
+            "source_url": url,
+            "price_source_field": "stooq.csv.close",
+            "change_percent_source_field": "",
+            "market_time_source_field": "stooq.csv.date+time",
         }
     return quotes, url
 
@@ -3806,6 +4086,10 @@ def fetch_alpha_vantage_quotes(symbols):
                 "beta": None,
                 "market_cap": None,
                 "provider": "alpha_vantage",
+                "source_url": url,
+                "price_source_field": "Global Quote.05. price",
+                "change_percent_source_field": "Global Quote.10. change percent",
+                "market_time_source_field": "Global Quote.07. latest trading day",
             }
         except Exception:
             continue
@@ -3953,6 +4237,27 @@ def quote_freshness_label(quote):
     return "live"
 
 
+def validate_traceable_quote_metrics(quote):
+    """Require numeric quote outputs to be tied to provider fields and a concrete source URL."""
+    q = quote or {}
+    price = to_float_or_none(q.get("price"))
+    if price is None:
+        return False, "missing-price"
+    provider = (q.get("provider") or "").strip()
+    if not provider:
+        return False, "missing-provider"
+    source_url = (q.get("source_url") or "").strip()
+    if not source_url:
+        return False, "missing-source-url"
+    price_field = (q.get("price_source_field") or "").strip()
+    if not price_field:
+        return False, "missing-price-source-field"
+    as_of_label = quote_as_of_label(q)
+    if as_of_label == "unknown":
+        return False, "missing-as-of-timestamp"
+    return True, ""
+
+
 def build_market_data_unavailable_message(symbols=None):
     """Return a user-facing quote fallback message for API/timeouts."""
     normalized = [normalize_ticker_symbol(s) for s in (symbols or [])]
@@ -4054,6 +4359,11 @@ def summarize_portfolio(portfolio, quotes, investment_amount):
 
     for ticker, weight in holdings.items():
         quote = quotes.get(ticker) or {}
+        is_traceable, _reason = validate_traceable_quote_metrics(quote)
+        if not is_traceable:
+            missing.append(ticker)
+            continue
+
         price = quote.get("price")
         change_pct = quote.get("change_percent")
         if price is None:
@@ -4070,16 +4380,18 @@ def summarize_portfolio(portfolio, quotes, investment_amount):
             beta_weight_sum += weight
         allocation_value = investment_amount * weight
         shares = allocation_value / float(price) if float(price) > 0 else 0.0
-        rows.append({
-            "ticker": ticker,
-            "weight_pct": weight_pct,
-            "price": float(price),
-            "change_pct": float(change_pct) if isinstance(change_pct, (int, float)) else None,
-            "allocation_value": allocation_value,
-            "shares": shares,
-            "as_of_label": quote_as_of_label(quote),
-            "data_freshness": quote_freshness_label(quote),
-        })
+        rows.append(
+            {
+                "ticker": ticker,
+                "weight_pct": weight_pct,
+                "price": float(price),
+                "change_pct": float(change_pct) if isinstance(change_pct, (int, float)) else None,
+                "allocation_value": allocation_value,
+                "shares": shares,
+                "as_of_label": quote_as_of_label(quote),
+                "data_freshness": quote_freshness_label(quote),
+            }
+        )
         freshness_states.append(quote_freshness_label(quote))
 
     if hhi < 0.18:
@@ -4122,7 +4434,7 @@ def summarize_portfolio(portfolio, quotes, investment_amount):
     }
 
 
-def get_portfolio_comparison_reply(normalized_text, original_text, include_sources=False):
+def get_portfolio_comparison_reply(normalized_text, original_text, include_sources=False, user_id=DEFAULT_USER_ID):
     """Compare portfolio setups using live market prices and latest daily changes."""
     portfolios = parse_portfolio_definitions(original_text)
     if not portfolios:
@@ -4139,6 +4451,18 @@ def get_portfolio_comparison_reply(normalized_text, original_text, include_sourc
 
     if not quotes:
         return build_market_data_unavailable_message(symbols)
+
+    for symbol in symbols:
+        quote = quotes.get(symbol) or {}
+        is_traceable, reason = validate_traceable_quote_metrics(quote)
+        if not is_traceable and quote.get("price") is not None:
+            log_metric_validation_block(
+                "portfolio-comparison",
+                f"untraceable-quote:{reason}",
+                {"symbol": symbol, "provider": quote.get("provider") or "unknown"},
+                user_id=user_id,
+            )
+            quotes[symbol] = {}
 
     investment_amount = extract_investment_amount_usd(original_text)
     summaries = [summarize_portfolio(p, quotes, investment_amount) for p in portfolios]
@@ -4197,7 +4521,7 @@ def get_portfolio_comparison_reply(normalized_text, original_text, include_sourc
     return with_citations("\n".join(lines), sources, include_sources)
 
 
-def get_live_quote_reply(normalized_text, original_text, include_sources=False):
+def get_live_quote_reply(normalized_text, original_text, include_sources=False, user_id=DEFAULT_USER_ID):
     """Return live or most-recent prices for one or more firms/tickers."""
     symbols = extract_ticker_candidates(original_text)
     if not symbols:
@@ -4232,6 +4556,16 @@ def get_live_quote_reply(normalized_text, original_text, include_sources=False):
     for symbol in symbols:
         quote = quotes.get(symbol) or {}
         price = quote.get("price")
+        is_traceable, reason = validate_traceable_quote_metrics(quote)
+        if price is not None and not is_traceable:
+            log_metric_validation_block(
+                "quote-reply",
+                f"untraceable-quote:{reason}",
+                {"symbol": symbol, "provider": quote.get("provider") or "unknown"},
+                user_id=user_id,
+            )
+            lines.append(f"- {symbol}: data unavailable, try again.")
+            continue
         if price is None:
             lines.append(f"- {symbol}: data unavailable, try again.")
             continue
@@ -4267,15 +4601,20 @@ def get_live_quote_reply(normalized_text, original_text, include_sources=False):
     return with_citations("\n".join(lines), sources, include_sources)
 
 
-def get_finance_reply(normalized_text, original_text, include_sources=False):
+def get_finance_reply(normalized_text, original_text, include_sources=False, user_id=DEFAULT_USER_ID):
     """Handle finance/economics queries around quotes and portfolio comparison."""
     if "portfolio" not in normalized_text and any(m in normalized_text for m in ["compare", "comparison", "vs", "versus"]):
-        comparison_reply = get_firm_comparison_reply(normalized_text, original_text, include_sources=include_sources)
+        comparison_reply = get_firm_comparison_reply(normalized_text, original_text, include_sources=include_sources, user_id=user_id)
         if comparison_reply:
             return comparison_reply
 
     if is_portfolio_comparison_query(normalized_text, original_text):
-        portfolio_reply = get_portfolio_comparison_reply(normalized_text, original_text, include_sources=include_sources)
+        portfolio_reply = get_portfolio_comparison_reply(
+            normalized_text,
+            original_text,
+            include_sources=include_sources,
+            user_id=user_id,
+        )
         if portfolio_reply:
             return portfolio_reply
 
@@ -4286,7 +4625,12 @@ def get_finance_reply(normalized_text, original_text, include_sources=False):
     ]
     symbol_candidates = extract_ticker_candidates(original_text)
     if any(marker in normalized_text for marker in finance_markers) or bool(symbol_candidates):
-        quote_reply = get_live_quote_reply(normalized_text, original_text, include_sources=include_sources)
+        quote_reply = get_live_quote_reply(
+            normalized_text,
+            original_text,
+            include_sources=include_sources,
+            user_id=user_id,
+        )
         if quote_reply:
             return quote_reply
 
@@ -5769,6 +6113,8 @@ def build_weekly_finance_report_lines(user_state, user_id=DEFAULT_USER_ID):
     subscription_profile = user_state.get("subscription_profile") or {}
 
     lines = [f"Generated: {utc_now_iso()}"]
+    lines.append("Data provenance: Watchlist prices are from live/cached quote providers (Yahoo/Stooq/Alpha Vantage).")
+    lines.append("Assumption disclosure: Any opportunity-cost projections in this report use explicitly stated annual-return assumptions and are illustrative, not guaranteed.")
 
     watchlist = finance_profile.get("watchlist") or []
     lines.append("")
@@ -5782,6 +6128,16 @@ def build_weekly_finance_report_lines(user_state, user_id=DEFAULT_USER_ID):
             quote = quotes.get(symbol) or {}
             price = quote.get("price")
             change = quote.get("change_percent")
+            is_traceable, reason = validate_traceable_quote_metrics(quote)
+            if price is not None and not is_traceable:
+                log_metric_validation_block(
+                    "weekly-report",
+                    f"untraceable-quote:{reason}",
+                    {"symbol": symbol, "provider": quote.get("provider") or "unknown"},
+                    user_id=user_id,
+                )
+                lines.append(f"- {symbol}: data unavailable, try again.")
+                continue
             if price is None:
                 lines.append(f"- {symbol}: data unavailable, try again.")
                 continue
@@ -6714,7 +7070,8 @@ def analytical_engine_execute(user_id, user_state, intent):
             f"- Shadow Runway: {'ON' if metrics['shadow_runway_enabled'] else 'OFF'} | safety buffer {metrics['safety_buffer_months']:.1f} months\n"
             f"- Dashboard display runway: {metrics['runway_display_months']:.1f} months ({metrics['runway_display_color']})\n"
             f"- Locked reserve (hidden emergency runway): {metrics['locked_months']:.1f} months\n"
-            f"- FX USD->{metrics['target_currency']}: {metrics['fx_rate_usd_to_target']:.6f}"
+            f"- FX USD->{metrics['target_currency']}: {metrics['fx_rate_usd_to_target']:.6f}\n"
+            "- Note: This is a disclosed calculation using your provided capital/budget inputs plus the app's PPP cost-index map and latest FX snapshot."
         )
         return {
             "ok": True,
@@ -6769,14 +7126,14 @@ def analytical_engine_execute(user_id, user_state, intent):
         if amount_usd < threshold:
             text = (
                 f"Alpha Rule note: this {item} purchase is ${amount_usd:.2f}, below your gating threshold of ${threshold:.2f}. "
-                f"At {rate_pct:.1f}% for {gate['years']} years, it still compounds to ${gate['future_value_usd']:.2f}."
+                f"Using an assumed {rate_pct:.1f}% annual return for {gate['years']} years, it compounds to about ${gate['future_value_usd']:.2f} (illustrative, not guaranteed)."
             )
             return {"ok": True, "action": action, "state_changed": True, "text": text}
 
         text = (
             f"Alpha Rule reality check: This ${amount_usd:.2f} {item} purchase can cost about "
-            f"${gate['future_value_usd']:.2f} over {gate['years']} years at {rate_pct:.1f}% annual return "
-            f"(${gate['opportunity_cost_usd']:.2f} in opportunity cost). Do you still want to execute?"
+            f"${gate['future_value_usd']:.2f} over {gate['years']} years using an assumed {rate_pct:.1f}% annual return "
+            f"(${gate['opportunity_cost_usd']:.2f} in opportunity cost; illustrative, not guaranteed). Do you still want to execute?"
         )
         return {
             "ok": True,
@@ -7760,7 +8117,7 @@ def get_random_anything_reply():
     return random.choice(buckets)
 
 
-def try_internet_answer(normalized_text, original_text="", include_sources=False):
+def try_internet_answer(normalized_text, original_text="", include_sources=False, user_id=DEFAULT_USER_ID):
     """Handle internet-powered intents like weather, news, date, and data lookup."""
     words = set(normalized_text.split())
     lower_original = original_text.lower().strip()
@@ -7772,7 +8129,7 @@ def try_internet_answer(normalized_text, original_text="", include_sources=False
     if is_personal_message_intent(normalized_text):
         return None
 
-    finance_reply = get_finance_reply(normalized_text, original_text, include_sources=include_sources)
+    finance_reply = get_finance_reply(normalized_text, original_text, include_sources=include_sources, user_id=user_id)
     if finance_reply:
         return finance_reply
 
@@ -7890,7 +8247,7 @@ def get_local_smart_reply(user_message, user_id=DEFAULT_USER_ID):
         previous_user_text = get_previous_user_message()
         if previous_user_text:
             citation_target = normalize_intent_text(previous_user_text)
-            citation_reply = try_internet_answer(citation_target, previous_user_text, include_sources=True)
+            citation_reply = try_internet_answer(citation_target, previous_user_text, include_sources=True, user_id=user_id)
             if citation_reply:
                 return citation_reply
 
@@ -7903,7 +8260,7 @@ def get_local_smart_reply(user_message, user_id=DEFAULT_USER_ID):
     if explanation_reply:
         return explanation_reply
 
-    internet_reply = try_internet_answer(normalized, user_message, include_sources=wants_citations)
+    internet_reply = try_internet_answer(normalized, user_message, include_sources=wants_citations, user_id=user_id)
     if internet_reply:
         if "how many" in normalized and "die" in normalized and "could not find" in internet_reply.lower():
             return (
@@ -9167,6 +9524,10 @@ li { margin: 6px 0; }
             <h2>Sent Cancellations</h2>
             <ul id="cancelList"></ul>
         </section>
+        <section class="card">
+            <h2>Blocked Metric Claims</h2>
+            <ul id="blockedMetricList"></ul>
+        </section>
     </div>
 </div>
 <script>
@@ -9224,6 +9585,13 @@ async function loadActivityLog() {
             data.sent_cancellations || [],
             (item) => `${item.service_name || 'unknown service'} | ${fmtTs(item.confirmation_ts)}`,
             'No cancellation sends recorded yet.'
+        );
+
+        fillList(
+            document.getElementById('blockedMetricList'),
+            data.blocked_metric_claims || [],
+            (item) => `${item.event || 'unknown event'} | ${item.reason || 'unknown reason'} | ${fmtTs(item.created_at)}`,
+            'No blocked metric claims recorded yet.'
         );
     } catch (e) {
         err.style.display = 'block';
@@ -9478,6 +9846,8 @@ def api_learning_status():
 def api_finance_quotes():
     """Return live or most-recent quote snapshots for comma-separated symbols."""
     mark_user_activity()
+    session_user_id = resolve_session_user_id()
+    user_id = sanitize_user_id(session_user_id or request.args.get("user_id") or DEFAULT_USER_ID)
     symbols_raw = (request.args.get("symbols") or "").strip()
     if not symbols_raw:
         return jsonify({"error": "Query parameter 'symbols' is required."}), 400
@@ -9499,6 +9869,18 @@ def api_finance_quotes():
     rows = []
     for symbol in symbols:
         quote = quotes_map.get(symbol) or {}
+        is_traceable, reason = validate_traceable_quote_metrics(quote)
+        if quote.get("price") is not None and not is_traceable:
+            log_metric_validation_block(
+                "quote-api",
+                f"untraceable-quote:{reason}",
+                {"symbol": symbol, "provider": quote.get("provider") or "unknown"},
+                user_id=user_id,
+            )
+            quote = dict(quote)
+            quote["price"] = None
+            quote["change_percent"] = None
+            quote["market_time"] = None
         as_of_label = quote_as_of_label(quote)
         freshness = quote_freshness_label(quote)
         rows.append({
@@ -9517,12 +9899,28 @@ def api_finance_quotes():
             "as_of_label": f"as of {as_of_label}",
             "cache_age_seconds": quote.get("cache_age_seconds"),
             "last_known_utc": quote.get("last_known_utc") or "",
+            "traceability": {
+                "provider": quote.get("provider") or "unknown",
+                "source_url": quote.get("source_url") or "",
+                "price_field": "regularMarketPrice|provider_equivalent",
+                "change_percent_field": "regularMarketChangePercent|provider_equivalent",
+                "market_time_field": "regularMarketTime|provider_equivalent",
+                "validation_error": "" if is_traceable else reason,
+            },
         })
 
     return jsonify({
         "as_of_utc": utc_now_iso(),
         "cache_ttl_seconds": FINANCE_QUOTE_CACHE_TTL_SECONDS,
         "source": source_url or "https://finance.yahoo.com/",
+        "traceability": {
+            "numeric_fields": [
+                "quotes[].price",
+                "quotes[].change_percent",
+                "quotes[].market_time",
+            ],
+            "data_origin": "provider API response or cache derived from provider response",
+        },
         "quotes": rows,
     })
 
@@ -9550,24 +9948,52 @@ def api_finance_watchlist():
             except Exception:
                 return jsonify({"error": "Failed to fetch quote snapshot."}), 502
             response["source"] = source_url or "https://finance.yahoo.com/"
-            response["quotes"] = [
-                {
-                    "symbol": symbol,
-                    "name": (quotes_map.get(symbol) or {}).get("name") or symbol,
-                    "price": (quotes_map.get(symbol) or {}).get("price"),
-                    "change_percent": (quotes_map.get(symbol) or {}).get("change_percent"),
-                    "market_time": (quotes_map.get(symbol) or {}).get("market_time"),
-                    "market_time_utc": format_quote_timestamp((quotes_map.get(symbol) or {}).get("market_time")),
-                    "provider": (quotes_map.get(symbol) or {}).get("provider") or "unknown",
-                    "stale": bool((quotes_map.get(symbol) or {}).get("stale")),
-                    "from_cache": bool((quotes_map.get(symbol) or {}).get("from_cache")),
-                    "data_freshness": quote_freshness_label(quotes_map.get(symbol) or {}),
-                    "as_of_label": f"as of {quote_as_of_label(quotes_map.get(symbol) or {})}",
-                    "cache_age_seconds": (quotes_map.get(symbol) or {}).get("cache_age_seconds"),
-                    "last_known_utc": (quotes_map.get(symbol) or {}).get("last_known_utc") or "",
-                }
-                for symbol in watchlist
-            ]
+            rows = []
+            for symbol in watchlist:
+                quote = quotes_map.get(symbol) or {}
+                is_traceable, reason = validate_traceable_quote_metrics(quote)
+                if quote.get("price") is not None and not is_traceable:
+                    log_metric_validation_block(
+                        "watchlist-api",
+                        f"untraceable-quote:{reason}",
+                        {"symbol": symbol, "provider": quote.get("provider") or "unknown"},
+                        user_id=user_id,
+                    )
+                    quote = dict(quote)
+                    quote["price"] = None
+                    quote["change_percent"] = None
+                    quote["market_time"] = None
+
+                rows.append(
+                    {
+                        "symbol": symbol,
+                        "name": quote.get("name") or symbol,
+                        "price": quote.get("price"),
+                        "change_percent": quote.get("change_percent"),
+                        "market_time": quote.get("market_time"),
+                        "market_time_utc": format_quote_timestamp(quote.get("market_time")),
+                        "provider": quote.get("provider") or "unknown",
+                        "stale": bool(quote.get("stale")),
+                        "from_cache": bool(quote.get("from_cache")),
+                        "data_freshness": quote_freshness_label(quote),
+                        "as_of_label": f"as of {quote_as_of_label(quote)}",
+                        "cache_age_seconds": quote.get("cache_age_seconds"),
+                        "last_known_utc": quote.get("last_known_utc") or "",
+                        "traceability": {
+                            "provider": quote.get("provider") or "unknown",
+                            "source_url": quote.get("source_url") or "",
+                            "price_field": "regularMarketPrice|provider_equivalent",
+                            "change_percent_field": "regularMarketChangePercent|provider_equivalent",
+                            "validation_error": "" if is_traceable else reason,
+                        },
+                    }
+                )
+
+            response["quotes"] = rows
+            response["traceability"] = {
+                "numeric_fields": ["quotes[].price", "quotes[].change_percent", "quotes[].market_time"],
+                "data_origin": "provider API response or cache derived from provider response",
+            }
         return jsonify(response)
 
     if reject_large_request(8192):
@@ -9677,6 +10103,11 @@ def api_finance_runway_buffer():
         return jsonify({
             "user_id": user_id,
             "runway_buffer": metrics,
+            "assumptions": [
+                "PPP-adjusted runway is computed from your provided capital/monthly cap inputs.",
+                "Cost-of-living adjustment uses CITY_COST_INDEX map values configured in the app.",
+                "FX conversion uses latest cached/fetched USD->target currency rate.",
+            ],
             "supported_cities": sorted(CITY_COST_INDEX.keys()),
         })
 
@@ -9725,6 +10156,11 @@ def api_finance_runway_buffer():
         "status": "ok",
         "user_id": user_id,
         "runway_buffer": metrics,
+        "assumptions": [
+            "PPP-adjusted runway is computed from your provided capital/monthly cap inputs.",
+            "Cost-of-living adjustment uses CITY_COST_INDEX map values configured in the app.",
+            "FX conversion uses latest cached/fetched USD->target currency rate.",
+        ],
         "saved_profile": finance_profile.get("runway_buffer_profile") or {},
     })
 
@@ -9794,6 +10230,9 @@ def api_finance_activity_log():
     sweep_history = cash_profile.get("hysa_auto_sweep_consent_history")
     if not isinstance(sweep_history, list):
         sweep_history = []
+    metric_history = (user_state.get("finance_profile") or {}).get("metric_validation_history")
+    if not isinstance(metric_history, list):
+        metric_history = []
 
     # Backfill one baseline consent entry from legacy field when history is absent.
     if not sweep_history:
@@ -9808,6 +10247,7 @@ def api_finance_activity_log():
             "override_history": sql_activity.get("overrides") or [],
             "sweep_consent_history": sweep_history[-200:][::-1],
             "sent_cancellations": sql_activity.get("cancellations") or [],
+            "blocked_metric_claims": metric_history[-200:][::-1],
         }
     )
 
@@ -9837,6 +10277,11 @@ def api_finance_opportunity_cost():
             "user_id": user_id,
             "threshold_usd": threshold,
             "opportunity_cost": gate,
+            "assumptions": [
+                "future_value uses compound growth formula FV = PV * (1 + r)^n.",
+                "annual_return is an assumed rate, not a guaranteed outcome.",
+                "results are illustrative projections.",
+            ],
         })
 
     if reject_large_request(8192):
