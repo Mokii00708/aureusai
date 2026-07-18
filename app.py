@@ -6453,6 +6453,16 @@ def get_personal_finance_feature_reply(user_message, user_state, user_id=DEFAULT
     if is_direct_investment_allocation_query(normalized):
         return build_investment_allocation_baseline_reply(include_sources=include_sources), False
 
+    # Handle live quote/portfolio finance intents deterministically before generic model fallback.
+    finance_lookup_reply = get_finance_reply(
+        normalized,
+        user_message,
+        include_sources=include_sources,
+        user_id=user_id,
+    )
+    if finance_lookup_reply:
+        return finance_lookup_reply, False
+
     # Two-engine architecture:
     # 1) Linguistic engine parses natural language into structured analytical intent.
     # 2) Analytical engine executes deterministic math/state/SQL logic.
