@@ -9520,6 +9520,7 @@ let isRegisteredSession = false;
 let selectedAttachments = [];
 const maxAttachments = 5;
 const maxAttachmentBytes = 6 * 1024 * 1024;
+const genericChatErrorMessage = 'Something went wrong on my side. Please try again in a moment.';
 let typingIndicator = null;
 
 async function refreshAuthSession() {
@@ -9711,9 +9712,14 @@ async function sendMessage() {
             body: formData
         });
 
-        const data = await response.json();
+        let data = null;
+        try {
+            data = await response.json();
+        } catch (_) {
+            throw new Error(genericChatErrorMessage);
+        }
         if (!response.ok) {
-            throw new Error(data.error || 'Failed to get response.');
+            throw new Error(genericChatErrorMessage);
         }
 
         hideTypingIndicator();
@@ -9723,7 +9729,8 @@ async function sendMessage() {
         addMessage('bot', data.reply || "I'm sorry, I'm not able to help you with that.");
     } catch (error) {
         hideTypingIndicator();
-        addMessage('bot', error?.message || "Upload or reply failed. Please try again.");
+        console.warn('chat send failed', error);
+        addMessage('bot', genericChatErrorMessage);
     } finally {
         hideTypingIndicator();
         isSending = false;
@@ -9990,53 +9997,69 @@ def infer_auto_control_reason(reply_text):
 def api_chat():
     mark_user_activity()
     disclaimer = "Informational only. Not financial advice."
-    is_multipart = request.content_type and "multipart/form-data" in request.content_type
-    request_limit = MAX_JSON_BODY_BYTES if not is_multipart else (MAX_JSON_BODY_BYTES + MAX_CHAT_ATTACHMENTS * MAX_ATTACHMENT_BYTES)
-    if reject_large_request(request_limit):
-        return jsonify({"error": "Payload too large.", "disclaimer": disclaimer, "reason": ""}), 413
-    data = request.form.to_dict() if is_multipart else (request.get_json(silent=True) or {})
-    user_message = (data.get("message") or "").strip()
-    session_user_id = resolve_session_user_id()
-    user_id = sanitize_user_id(session_user_id or data.get("user_id") or DEFAULT_USER_ID)
-    remember_history = parse_bool(data.get("remember_history"), default=True)
-    uploaded_files = request.files.getlist("attachments") if is_multipart else []
-
-    if (user_message or uploaded_files) and is_user_rate_limited(
-        user_id,
-        scope="chat-llm",
-        max_hits=CHAT_USER_RATE_LIMIT_MAX,
-        window_seconds=CHAT_USER_RATE_LIMIT_WINDOW,
-    ):
-        return jsonify({
-            "error": "Too many requests. Please wait before sending more messages.",
-            "disclaimer": disclaimer,
-            "reason": "Rate limit reached to prevent abuse and uncontrolled API costs.",
-        }), 429
-
-    attachment_summaries = analyze_uploaded_files(uploaded_files)
-    if attachment_summaries:
-        attachment_block = "\n\nUploaded attachment analysis:\n" + "\n\n".join(attachment_summaries)
-        user_message = f"{user_message or 'Please analyze these uploads.'}{attachment_block}"
-
-    if not user_message:
-        return jsonify({"error": "Message is required.", "disclaimer": disclaimer, "reason": ""}), 400
-
-    if should_use_simple_fallback(user_message):
-        return jsonify({"reply": "I'm sorry, I'm not able to help you with that.", "disclaimer": disclaimer, "reason": ""})
+    generic_chat_reply = "Something went wrong on my side. Please try again in a moment."
+    remember_history = True
+    user_id = DEFAULT_USER_ID
+    attachment_summaries = []
 
     try:
-        reply = get_ai_response_sync(user_message, user_id=user_id, remember_history=remember_history)
-    except Exception:
-        reply = DATA_UNAVAILABLE_RETRY_MESSAGE
-    reason = infer_auto_control_reason(reply)
-    return jsonify({
-        "reply": reply,
-        "user_id": user_id,
-        "remember_history": remember_history,
-        "attachment_analysis_summary": "\n\n".join(attachment_summaries[:3]) if attachment_summaries else "",
-        "disclaimer": disclaimer,
-        "reason": reason,
-    })
+        is_multipart = request.content_type and "multipart/form-data" in request.content_type
+        request_limit = MAX_JSON_BODY_BYTES if not is_multipart else (MAX_JSON_BODY_BYTES + MAX_CHAT_ATTACHMENTS * MAX_ATTACHMENT_BYTES)
+        if reject_large_request(request_limit):
+            return jsonify({"error": "Payload too large.", "disclaimer": disclaimer, "reason": ""}), 413
+        data = request.form.to_dict() if is_multipart else (request.get_json(silent=True) or {})
+        user_message = (data.get("message") or "").strip()
+        session_user_id = resolve_session_user_id()
+        user_id = sanitize_user_id(session_user_id or data.get("user_id") or DEFAULT_USER_ID)
+        remember_history = parse_bool(data.get("remember_history"), default=True)
+        uploaded_files = request.files.getlist("attachments") if is_multipart else []
+
+        if (user_message or uploaded_files) and is_user_rate_limited(
+            user_id,
+            scope="chat-llm",
+            max_hits=CHAT_USER_RATE_LIMIT_MAX,
+            window_seconds=CHAT_USER_RATE_LIMIT_WINDOW,
+        ):
+            return jsonify({
+                "error": "Too many requests. Please wait before sending more messages.",
+                "disclaimer": disclaimer,
+                "reason": "Rate limit reached to prevent abuse and uncontrolled API costs.",
+            }), 429
+
+        attachment_summaries = analyze_uploaded_files(uploaded_files)
+        if attachment_summaries:
+            attachment_block = "\n\nUploaded attachment analysis:\n" + "\n\n".join(attachment_summaries)
+            user_message = f"{user_message or 'Please analyze these uploads.'}{attachment_block}"
+
+        if not user_message:
+            return jsonify({"error": "Message is required.", "disclaimer": disclaimer, "reason": ""}), 400
+
+        if should_use_simple_fallback(user_message):
+            return jsonify({"reply": "I'm sorry, I'm not able to help you with that.", "disclaimer": disclaimer, "reason": ""})
+
+        try:
+            reply = get_ai_response_sync(user_message, user_id=user_id, remember_history=remember_history)
+        except Exception:
+            reply = DATA_UNAVAILABLE_RETRY_MESSAGE
+        reason = infer_auto_control_reason(reply)
+        return jsonify({
+            "reply": reply,
+            "user_id": user_id,
+            "remember_history": remember_history,
+            "attachment_analysis_summary": "\n\n".join(attachment_summaries[:3]) if attachment_summaries else "",
+            "disclaimer": disclaimer,
+            "reason": reason,
+        })
+    except Exception as e:
+        print(f"Warning: api_chat unexpected error: {e}")
+        return jsonify({
+            "reply": generic_chat_reply,
+            "user_id": user_id,
+            "remember_history": remember_history,
+            "attachment_analysis_summary": "\n\n".join(attachment_summaries[:3]) if attachment_summaries else "",
+            "disclaimer": disclaimer,
+            "reason": "",
+        }), 200
 
 
 @app.route("/api/feedback", methods=["POST"])
