@@ -4534,6 +4534,8 @@ def fetch_live_quotes(symbols):
             if cached and now_ts - cached.get("cached_at", 0) <= FINANCE_QUOTE_CACHE_TTL_SECONDS:
                 recovered = dict(cached.get("quote") or {})
                 cached_at = float(cached.get("cached_at") or 0.0)
+                if not recovered.get("market_time") and cached_at:
+                    recovered["market_time"] = int(cached_at)
                 recovered["from_cache"] = True
                 recovered["cache_age_seconds"] = max(0.0, now_ts - cached_at) if cached_at else 0.0
                 recovered["last_known_utc"] = datetime.fromtimestamp(cached_at, tz=timezone.utc).isoformat() if cached_at else ""
@@ -4629,6 +4631,8 @@ def fetch_live_quotes(symbols):
         with finance_cache_lock:
             for symbol, quote in quotes.items():
                 if symbol in requested:
+                    if not quote.get("market_time"):
+                        quote["market_time"] = int(now_cached_at)
                     quote["from_cache"] = False
                     finance_quote_cache[symbol] = {
                         "cached_at": now_cached_at,
@@ -4645,6 +4649,8 @@ def fetch_live_quotes(symbols):
             if cached:
                 recovered = dict(cached.get("quote") or {})
                 cached_at = float(cached.get("cached_at") or 0.0)
+                if not recovered.get("market_time") and cached_at:
+                    recovered["market_time"] = int(cached_at)
                 recovered["stale"] = True
                 recovered["from_cache"] = True
                 recovered["cache_age_seconds"] = max(0.0, time.time() - cached_at) if cached_at else None
