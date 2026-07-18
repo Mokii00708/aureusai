@@ -2193,8 +2193,13 @@ def get_ai_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True
             save_user_state(user_id, user_state)
         
         return full_response
-    except Exception:
-        assistant_message = DATA_UNAVAILABLE_RETRY_MESSAGE
+    except Exception as e:
+        print(f"Warning: get_ai_response model call failed: {e}")
+        assistant_message = get_local_smart_reply(user_message, user_id=user_id)
+        if not (assistant_message or "").strip():
+            assistant_message = DATA_UNAVAILABLE_RETRY_MESSAGE
+        assistant_message = apply_tone_style(assistant_message, user_message)
+        assistant_message = merge_witty_alert(assistant_message, subscription_alert)
         conversation_history.append({"role": "assistant", "content": assistant_message})
         save_history(conversation_history)
         if remember_history:
@@ -2333,8 +2338,14 @@ def get_ai_response_sync(user_message, user_id=DEFAULT_USER_ID, remember_history
         if remember_history or alert_state_changed or sweep_changed:
             save_user_state(user_id, user_state)
         return assistant_message
-    except Exception:
-        assistant_message = localize_reply(DATA_UNAVAILABLE_RETRY_MESSAGE, target_language)
+    except Exception as e:
+        print(f"Warning: get_ai_response_sync model call failed: {e}")
+        assistant_message = get_local_smart_reply(user_message, user_id=user_id)
+        if not (assistant_message or "").strip():
+            assistant_message = DATA_UNAVAILABLE_RETRY_MESSAGE
+        assistant_message = apply_tone_style(assistant_message, user_message)
+        assistant_message = localize_reply(assistant_message, target_language)
+        assistant_message = merge_witty_alert(assistant_message, subscription_alert)
         conversation_history.append({"role": "assistant", "content": assistant_message})
         save_history(conversation_history)
         if remember_history:
