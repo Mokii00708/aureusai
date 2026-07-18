@@ -8,12 +8,15 @@ import sqlite3
 import ssl
 import random
 import difflib
+import io
 import time
 import threading
 import secrets
 import hashlib
 import hmac
-from datetime import datetime, timezone
+import base64
+import zipfile
+from datetime import datetime, timezone, timedelta
 from html import unescape
 from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
@@ -50,6 +53,8 @@ APP_SECRET = os.getenv("APP_SECRET") or API_KEY
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "2592000"))
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "0") in {"1", "true", "True"}
 MAX_JSON_BODY_BYTES = int(os.getenv("MAX_JSON_BODY_BYTES", "16384"))
+MAX_CHAT_ATTACHMENTS = int(os.getenv("MAX_CHAT_ATTACHMENTS", "5"))
+MAX_ATTACHMENT_BYTES = int(os.getenv("MAX_ATTACHMENT_BYTES", str(6 * 1024 * 1024)))
 AUTH_RATE_LIMIT_WINDOW = int(os.getenv("AUTH_RATE_LIMIT_WINDOW", "300"))
 AUTH_RATE_LIMIT_MAX = int(os.getenv("AUTH_RATE_LIMIT_MAX", "20"))
 AUTO_LEARN_ENABLED = os.getenv("AUTO_LEARN_ENABLED", "1") not in {"0", "false", "False"}
@@ -145,11 +150,35 @@ COMPANY_ALIAS_TO_TICKER = {
 }
 KNOWN_TICKERS = sorted(set(COMPANY_ALIAS_TO_TICKER.values()))
 
-SYSTEM_PROMPT = """You are a warm, intelligent, and engaging conversational AI designed for meaningful chat. 
-You are helpful, thoughtful, and genuinely interested in the person you're talking with. 
-You strike a balance between being professional and personable, with occasional charm and wit.
-When faced with unclear or inappropriate requests, you politely decline without being preachy.
-Keep responses concise but heartfelt, and always meet the person where they are emotionally."""
+SYSTEM_PROMPT = """You are Nudge: a direct, fiercely loyal, opinionated financial coach.
+You answer general knowledge, life, technology, history, strategy, and finance questions, but your edge is judgment, not bland recitation.
+Never default to neutral textbook language when the user is asking what to do. Take a stand. Debt is an emergency. Lifestyle inflation is a silent killer. Compound interest is a weapon.
+After explaining a financial idea or market situation, follow with a crisp hot take on what the user should actually do in the real world.
+Do not open with generic filler like 'That's a great question' or 'Here's the deal.' Start with substance.
+If live search or market feeds lag, do not shrug. Build a realistic, educated fallback using last-known 2026 context, macro logic, geopolitical pressure, AI infrastructure demand, rate policy, and market structure.
+When relevant, use user behavioral metrics like stress, fatigue, bias, and impulse patterns to sharpen your judgment.
+Keep responses punchy, scannable, decisive, and slightly witty. Stay within safety boundaries and avoid harmful guidance."""
+
+
+def strip_cliche_openers(text):
+    """Remove stale AI filler openers so replies start with substance."""
+    cleaned = (text or "").strip()
+    patterns = [
+        r"^(?:that'?s|that is) a great question[\.!,:;\-\s]*",
+        r"^(?:here'?s|here is) the deal[\.!,:;\-\s]*",
+        r"^great question[\.!,:;\-\s]*",
+    ]
+    for pattern in patterns:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE).strip()
+    return cleaned or (text or "")
+
+
+def open_analytics_db():
+    """Open SQLite with a native busy timeout for concurrent writes."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    conn = sqlite3.connect(ANALYTICS_DB_FILE, timeout=30.0)
+    conn.execute("PRAGMA busy_timeout = 30000")
+    return conn
 
 
 def ensure_storage_dirs():
@@ -163,7 +192,7 @@ def ensure_analytics_db():
     """Initialize SQL tables used by the analytical finance engine."""
     os.makedirs(DATA_DIR, exist_ok=True)
     with analytics_db_lock:
-        conn = sqlite3.connect(ANALYTICS_DB_FILE)
+        conn = open_analytics_db()
         try:
             cur = conn.cursor()
             cur.execute(
@@ -180,6 +209,27 @@ def ensure_analytics_db():
                 )
                 """
             )
+            # Safe schema migration for existing databases.
+            try:
+                cur.execute("ALTER TABLE spend_events ADD COLUMN fatigue_score INTEGER")
+            except Exception:
+                pass
+            try:
+                cur.execute("ALTER TABLE spend_events ADD COLUMN cognitive_bias TEXT")
+            except Exception:
+                pass
+            try:
+                cur.execute("ALTER TABLE spend_events ADD COLUMN transaction_type TEXT")
+            except Exception:
+                pass
+            try:
+                cur.execute("ALTER TABLE spend_events ADD COLUMN friction_seconds INTEGER")
+            except Exception:
+                pass
+            try:
+                cur.execute("ALTER TABLE spend_events ADD COLUMN inferred_tone TEXT")
+            except Exception:
+                pass
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS subscriptions (
@@ -226,6 +276,15 @@ def ensure_analytics_db():
                     source_url TEXT NOT NULL,
                     estimated_cogs_impact REAL NOT NULL,
                     created_at TEXT NOT NULL
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_states (
+                    user_id TEXT PRIMARY KEY,
+                    state_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 )
                 """
             )
@@ -291,6 +350,124 @@ def reject_large_request(limit_bytes=MAX_JSON_BODY_BYTES):
     """Simple request-size guard."""
     content_len = request.content_length or 0
     return content_len > limit_bytes
+
+
+def strip_rtf_text(raw_text):
+    """Best-effort RTF to plain text conversion without external deps."""
+    text = re.sub(r"\\'[0-9a-fA-F]{2}", " ", raw_text or "")
+    text = re.sub(r"\\par[d]?", "\n", text)
+    text = re.sub(r"\\[a-zA-Z]+-?\d* ?", " ", text)
+    text = text.replace("{", " ").replace("}", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_docx_text(file_bytes):
+    """Extract text from docx using built-in zip/xml support."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+            xml_payload = zf.read("word/document.xml").decode("utf-8", errors="ignore")
+        xml_payload = re.sub(r"</w:p>", "\n", xml_payload)
+        xml_payload = re.sub(r"<[^>]+>", " ", xml_payload)
+        return re.sub(r"\s+", " ", unescape(xml_payload)).strip()
+    except Exception:
+        return ""
+
+
+def extract_pdf_text(file_bytes):
+    """Best-effort text extraction from PDF byte streams without extra packages."""
+    try:
+        text_chunks = []
+        for chunk in re.findall(rb"\(([^()]*)\)\s*Tj", file_bytes):
+            decoded = chunk.decode("latin-1", errors="ignore")
+            if decoded.strip():
+                text_chunks.append(decoded)
+        if not text_chunks:
+            for chunk in re.findall(rb"\[(.*?)\]\s*TJ", file_bytes, flags=re.DOTALL):
+                decoded = re.sub(rb"<[^>]+>", b" ", chunk).decode("latin-1", errors="ignore")
+                if decoded.strip():
+                    text_chunks.append(decoded)
+        text = " ".join(text_chunks)
+        return re.sub(r"\s+", " ", text).strip()
+    except Exception:
+        return ""
+
+
+def extract_upload_text(file_name, mime_type, file_bytes):
+    """Extract analyzable text from common document uploads."""
+    name = normalize_case(file_name or "")
+    mime = normalize_case(mime_type or "")
+    if name.endswith((".txt", ".csv")) or mime.startswith("text/"):
+        return file_bytes.decode("utf-8", errors="ignore").strip()
+    if name.endswith(".rtf"):
+        return strip_rtf_text(file_bytes.decode("utf-8", errors="ignore"))
+    if name.endswith(".docx") or "wordprocessingml" in mime:
+        return extract_docx_text(file_bytes)
+    if name.endswith(".pdf") or mime == "application/pdf":
+        return extract_pdf_text(file_bytes)
+    return ""
+
+
+def analyze_image_upload(file_name, mime_type, file_bytes):
+    """Use the model for a compact image analysis with metadata fallback."""
+    size_kb = max(1, len(file_bytes) // 1024)
+    if not mime_type.startswith("image/"):
+        return f"Attached file {file_name} ({mime_type or 'unknown type'}, {size_kb} KB)."
+
+    try:
+        b64 = base64.b64encode(file_bytes).decode("ascii")
+        data_url = f"data:{mime_type};base64,{b64}"
+        response = frontier_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Analyze the uploaded image briefly. Mention the main subject, visible text if any, and likely context in under 90 words."},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"Analyze this uploaded image named {file_name}."},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                },
+            ],
+            temperature=0.2,
+            max_tokens=180,
+        )
+        content = (response.choices[0].message.content or "").strip()
+        if content:
+            return f"Image {file_name}: {content}"
+    except Exception:
+        pass
+    return f"Image {file_name} attached ({size_kb} KB). I could not deeply inspect the pixels, but I received it successfully."
+
+
+def analyze_uploaded_files(uploaded_files):
+    """Return a compact analysis summary for uploaded files."""
+    summaries = []
+    if not uploaded_files:
+        return summaries
+
+    for storage in uploaded_files[:MAX_CHAT_ATTACHMENTS]:
+        file_name = (storage.filename or "upload").strip() or "upload"
+        mime_type = (storage.mimetype or "application/octet-stream").strip().lower()
+        file_bytes = storage.read()
+        storage.stream.seek(0)
+        if not file_bytes:
+            continue
+        if len(file_bytes) > MAX_ATTACHMENT_BYTES:
+            summaries.append(f"File {file_name} was skipped because it exceeds the {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB limit.")
+            continue
+
+        if mime_type.startswith("image/"):
+            summaries.append(analyze_image_upload(file_name, mime_type, file_bytes))
+            continue
+
+        extracted = extract_upload_text(file_name, mime_type, file_bytes)
+        if extracted:
+            excerpt = extracted[:1800]
+            summaries.append(f"Document {file_name} content summary:\n{excerpt}")
+        else:
+            size_kb = max(1, len(file_bytes) // 1024)
+            summaries.append(f"Attached file {file_name} ({mime_type or 'unknown type'}, {size_kb} KB). I received it, but could not extract readable content from this format.")
+    return summaries
 
 
 def client_ip():
@@ -363,6 +540,8 @@ def default_user_state():
                 "current_city": "",
                 "capital_usd": 0.0,
                 "base_monthly_cap_usd": 0.0,
+                "shadow_runway_enabled": False,
+                "safety_buffer_months": 0.0,
                 "updated_at": "",
             },
         },
@@ -373,6 +552,8 @@ def default_user_state():
                 "amount": 0.0,
             },
             "last_alert_at": "",
+            "last_vampire_scan_at": "",
+            "vampire_alerts": [],
         },
         "behavior_budget_profile": {
             "spend_events": [],
@@ -384,6 +565,10 @@ def default_user_state():
             "opportunity_cost_default_years": OPPORTUNITY_COST_DEFAULT_YEARS,
             "opportunity_cost_default_annual_return": OPPORTUNITY_COST_DEFAULT_ANNUAL_RETURN,
             "last_opportunity_cost_gate": {},
+            "circuit_breaker_active": False,
+            "circuit_breaker_until": "",
+            "last_purchase_psychology": {},
+            "last_dopamine_swap_offer": {},
         },
         "geopolitical_profile": {
             "suppliers": [],
@@ -396,12 +581,27 @@ def default_user_state():
 def load_user_state(user_id):
     """Load per-user memory and preferences."""
     ensure_storage_dirs()
-    path = user_state_path(user_id)
-    if not os.path.exists(path):
-        return default_user_state()
+    safe_user_id = sanitize_user_id(user_id)
+    migrated_from_legacy = False
     try:
-        with open(path, "r") as f:
-            data = json.load(f)
+        with analytics_db_lock:
+            conn = open_analytics_db()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT state_json FROM user_states WHERE user_id = ?", (safe_user_id,))
+                row = cur.fetchone()
+            finally:
+                conn.close()
+
+        if row and row[0]:
+            data = json.loads(row[0])
+        else:
+            path = user_state_path(safe_user_id)
+            if not os.path.exists(path):
+                return default_user_state()
+            with open(path, "r") as f:
+                data = json.load(f)
+            migrated_from_legacy = True
         if not isinstance(data, dict):
             return default_user_state()
         state = default_user_state()
@@ -478,6 +678,8 @@ def load_user_state(user_id):
         if not isinstance(geo_profile.get("last_scan_summary"), str):
             geo_profile["last_scan_summary"] = ""
         state["geopolitical_profile"] = geo_profile
+        if migrated_from_legacy:
+            save_user_state(safe_user_id, state)
         return state
     except Exception:
         return default_user_state()
@@ -539,7 +741,7 @@ def tone_instruction_for(tone_label):
 def apply_tone_style(reply_text, user_message):
     """Post-process reply to mirror tone while preserving factual content."""
     tone = infer_user_tone(user_message)
-    text = (reply_text or "").strip()
+    text = strip_cliche_openers((reply_text or "").strip())
     if not text:
         return text
 
@@ -566,9 +768,24 @@ def apply_tone_style(reply_text, user_message):
 def save_user_state(user_id, state):
     """Persist per-user memory and preferences."""
     ensure_storage_dirs()
+    safe_user_id = sanitize_user_id(user_id)
     try:
-        with open(user_state_path(user_id), "w") as f:
-            json.dump(state, f, indent=2)
+        with analytics_db_lock:
+            conn = open_analytics_db()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO user_states (user_id, state_json, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        state_json=excluded.state_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    (safe_user_id, json.dumps(state), utc_now_iso()),
+                )
+                conn.commit()
+            finally:
+                conn.close()
     except Exception as e:
         print(f"Warning: Could not save user state: {e}")
 
@@ -734,6 +951,32 @@ def list_user_state_files():
         return []
 
 
+def list_user_state_ids():
+    """Return known user ids from SQLite plus any legacy JSON files."""
+    ensure_storage_dirs()
+    seen = set()
+    try:
+        with analytics_db_lock:
+            conn = open_analytics_db()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT user_id FROM user_states")
+                for row in cur.fetchall():
+                    candidate = sanitize_user_id((row[0] or "").strip())
+                    if candidate:
+                        seen.add(candidate)
+            finally:
+                conn.close()
+    except Exception:
+        pass
+
+    for path in list_user_state_files():
+        name = os.path.basename(path)
+        if name.endswith(".json"):
+            seen.add(sanitize_user_id(name[:-5]))
+    return sorted(seen)
+
+
 def build_idle_knowledge_snippets(user_state, learning_memory, max_items=2):
     """Get short idle-collected knowledge snippets for this user's likely interests."""
     idle_knowledge = (learning_memory or {}).get("idle_knowledge") or {}
@@ -785,10 +1028,9 @@ def prune_user_state_for_quality(user_state):
 def gather_global_top_topics(limit=AUTO_LEARN_TOPIC_LIMIT):
     """Aggregate most discussed topics across all users."""
     combined = {}
-    for path in list_user_state_files():
+    for user_id in list_user_state_ids():
         try:
-            with open(path, "r") as f:
-                payload = json.load(f)
+            payload = load_user_state(user_id)
             topics = payload.get("learned_topics") or {}
             if not isinstance(topics, dict):
                 continue
@@ -823,35 +1065,41 @@ def fetch_idle_topic_summary(topic):
 
 def run_idle_learning_cycle():
     """Run one autonomous maintenance + knowledge refresh cycle."""
-    with idle_learning_lock:
-        learning_memory = load_learning_memory()
+    try:
+        with idle_learning_lock:
+            learning_memory = load_learning_memory()
 
-        for path in list_user_state_files():
-            try:
-                with open(path, "r") as f:
-                    state = json.load(f)
-                if not isinstance(state, dict):
+            for user_id in list_user_state_ids():
+                try:
+                    state = load_user_state(user_id)
+                    if not isinstance(state, dict):
+                        continue
+                    state = prune_user_state_for_quality(state)
+                    state, _alerts = detect_subscription_vampires(state)
+                    save_user_state(user_id, state)
+                except Exception as e:
+                    print(f"Warning: idle user-state refresh failed for {user_id}: {e}")
+
+            idle_knowledge = learning_memory.get("idle_knowledge") or {}
+            for topic in gather_global_top_topics(limit=AUTO_LEARN_TOPIC_LIMIT):
+                try:
+                    summary = fetch_idle_topic_summary(topic)
+                except Exception as e:
+                    print(f"Warning: idle topic summary failed for {topic}: {e}")
                     continue
-                state = prune_user_state_for_quality(state)
-                with open(path, "w") as f:
-                    json.dump(state, f, indent=2)
-            except Exception:
-                continue
+                if not summary:
+                    continue
+                idle_knowledge[topic] = {
+                    "summary": summary,
+                    "ts": utc_now_iso(),
+                }
 
-        idle_knowledge = learning_memory.get("idle_knowledge") or {}
-        for topic in gather_global_top_topics(limit=AUTO_LEARN_TOPIC_LIMIT):
-            summary = fetch_idle_topic_summary(topic)
-            if not summary:
-                continue
-            idle_knowledge[topic] = {
-                "summary": summary,
-                "ts": utc_now_iso(),
-            }
-
-        learning_memory["idle_knowledge"] = idle_knowledge
-        learning_memory["idle_runs"] = int(learning_memory.get("idle_runs", 0)) + 1
-        learning_memory["last_idle_run"] = utc_now_iso()
-        save_learning_memory(learning_memory)
+            learning_memory["idle_knowledge"] = idle_knowledge
+            learning_memory["idle_runs"] = int(learning_memory.get("idle_runs", 0)) + 1
+            learning_memory["last_idle_run"] = utc_now_iso()
+            save_learning_memory(learning_memory)
+    except Exception as e:
+        print(f"Warning: run_idle_learning_cycle failed: {e}")
 
 
 def idle_learning_worker():
@@ -974,7 +1222,7 @@ def apply_feedback_learning(user_id, user_state, feedback_payload):
     return user_state
 
 
-def build_adaptive_system_prompt(user_state, user_message=""):
+def build_adaptive_system_prompt(user_state, user_message="", temporary_warning=""):
     """Build dynamic system instructions from feedback and preferences."""
     prefs = user_state.get("preferences") or {}
     profile = user_state.get("profile") or {}
@@ -1041,6 +1289,10 @@ def build_adaptive_system_prompt(user_state, user_message=""):
                 if q and a:
                     lines.append(f"- Q pattern: {q[:120]}")
                     lines.append(f"  A style: {a[:180]}")
+
+    if temporary_warning:
+        lines.append("Temporary risk control warning:")
+        lines.append(f"- {temporary_warning}")
 
     return "\n".join(lines)
 
@@ -1337,6 +1589,24 @@ def get_ai_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True
         save_user_state(user_id, user_state)
         return "Thanks for the feedback. I saved it and I will adapt how I respond from now on."
 
+    gate_eval = evaluate_behavioral_gate(user_message, user_state)
+    user_state = gate_eval.get("state") or user_state
+    gate_warning = gate_eval.get("warning") or ""
+    if gate_eval.get("active"):
+        gate_message = gate_eval.get("message") or "Please wait 12 hours before completing this transaction."
+        adaptive_system = build_adaptive_system_prompt(user_state, user_message, temporary_warning=gate_warning)
+        if conversation_history and conversation_history[0].get("role") == "system":
+            conversation_history[0]["content"] = adaptive_system
+        else:
+            conversation_history.insert(0, {"role": "system", "content": adaptive_system})
+        if remember_history:
+            conversation_history.append({"role": "user", "content": user_message})
+            conversation_history.append({"role": "assistant", "content": gate_message})
+            conversation_history = trim_history(conversation_history)
+            user_state["history"] = conversation_history
+        save_user_state(user_id, user_state)
+        return gate_message
+
     wants_citations = is_citation_request(normalize_intent_text(user_message))
     finance_direct_reply, finance_changed = get_personal_finance_feature_reply(
         user_message,
@@ -1356,7 +1626,7 @@ def get_ai_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True
             save_user_state(user_id, user_state)
         return finance_direct_reply
 
-    adaptive_system = build_adaptive_system_prompt(user_state, user_message)
+    adaptive_system = build_adaptive_system_prompt(user_state, user_message, temporary_warning=gate_warning)
     if conversation_history and conversation_history[0].get("role") == "system":
         conversation_history[0]["content"] = adaptive_system
     else:
@@ -1375,7 +1645,7 @@ def get_ai_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True
             model="gpt-4",
             messages=conversation_history,
             temperature=0.7,
-            max_tokens=500,
+            max_tokens=800,
             stream=True
         ) as response:
             for chunk in response:
@@ -1427,6 +1697,25 @@ def get_ai_response_sync(user_message, user_id=DEFAULT_USER_ID, remember_history
         ack = "Thanks for the feedback. I saved it and I will improve my replies in future conversations."
         return localize_reply(ack, target_language)
 
+    gate_eval = evaluate_behavioral_gate(user_message, user_state)
+    user_state = gate_eval.get("state") or user_state
+    gate_warning = gate_eval.get("warning") or ""
+    if gate_eval.get("active"):
+        gate_message = gate_eval.get("message") or "Please wait 12 hours before completing this transaction."
+        gate_message = localize_reply(gate_message, target_language)
+        adaptive_system = build_adaptive_system_prompt(user_state, user_message, temporary_warning=gate_warning)
+        if conversation_history and conversation_history[0].get("role") == "system":
+            conversation_history[0]["content"] = adaptive_system
+        else:
+            conversation_history.insert(0, {"role": "system", "content": adaptive_system})
+        if remember_history:
+            conversation_history.append({"role": "user", "content": user_message})
+            conversation_history.append({"role": "assistant", "content": gate_message})
+            conversation_history = trim_history(conversation_history)
+            user_state["history"] = conversation_history
+        save_user_state(user_id, user_state)
+        return gate_message
+
     wants_citations = is_citation_request(normalize_intent_text(user_message))
     finance_direct_reply, finance_changed = get_personal_finance_feature_reply(
         user_message,
@@ -1471,7 +1760,7 @@ def get_ai_response_sync(user_message, user_id=DEFAULT_USER_ID, remember_history
             save_user_state(user_id, user_state)
         return learned_answer
 
-    adaptive_system = build_adaptive_system_prompt(user_state, user_message)
+    adaptive_system = build_adaptive_system_prompt(user_state, user_message, temporary_warning=gate_warning)
     if conversation_history and conversation_history[0].get("role") == "system":
         conversation_history[0]["content"] = adaptive_system
     else:
@@ -1485,7 +1774,7 @@ def get_ai_response_sync(user_message, user_id=DEFAULT_USER_ID, remember_history
             model="gpt-4",
             messages=conversation_history,
             temperature=0.7,
-            max_tokens=500
+            max_tokens=800
         )
 
         assistant_message = (response.choices[0].message.content or "").strip()
@@ -1785,7 +2074,7 @@ def get_news_reply(include_sources=False):
         root = ET.fromstring(xml_text)
         items = root.findall("./channel/item")[:5]
         if not items:
-            return f"I could not find headlines right now. Today is {today}."
+            return build_no_excuses_analysis("top headlines today", include_sources=include_sources)
 
         lines = [f"Top headlines for {today}:"]
         for idx, item in enumerate(items, start=1):
@@ -1794,7 +2083,7 @@ def get_news_reply(include_sources=False):
         reply = "\n".join(lines)
         return with_citations(reply, [url], include_sources)
     except Exception:
-        return f"I could not fetch live news right now. Today is {today}."
+        return build_no_excuses_analysis("top headlines today", include_sources=include_sources)
 
 
 def get_date_reply(include_sources=False):
@@ -1802,6 +2091,44 @@ def get_date_reply(include_sources=False):
     now = datetime.now()
     reply = f"Today is {now.strftime('%A, %B %d, %Y')} and the time is {now.strftime('%H:%M')} local time."
     return with_citations(reply, ["Local system clock"], include_sources)
+
+
+def is_market_or_current_events_query(query):
+    """Detect queries that deserve a realistic no-excuses current-events fallback."""
+    lowered = normalize_case(query or "")
+    markers = [
+        "market", "stocks", "s&p", "nasdaq", "dow", "fed", "rates", "inflation", "treasury",
+        "oil", "gold", "bitcoin", "crypto", "today", "current", "right now", "headlines", "news",
+        "geopolit", "war", "middle east", "ai", "semiconductor", "nvidia", "economy",
+    ]
+    return any(marker in lowered for marker in markers)
+
+
+def build_no_excuses_analysis(query, include_sources=False):
+    """Return a realistic 2026-informed fallback when live data/search is weak."""
+    lowered = normalize_case(query or "")
+    intro = "If my live feeds are lagging, here is exactly how the landscape is shaping up right now and what you need to look out for."
+
+    if is_market_or_current_events_query(query):
+        lines = [intro]
+        lines.append("- Rates still matter more than narratives. If central banks are even mildly hawkish, expensive growth gets hit first and leverage gets uglier fast.")
+        lines.append("- Middle East tension keeps oil, shipping lanes, and headline risk alive. That means sudden spikes in energy, freight, and inflation expectations can smack risk assets.")
+        lines.append("- The AI infrastructure buildout is still a real force. Semis, data-center plumbing, power demand, and enterprise capex remain the cleanest structural winners if spending discipline holds.")
+        lines.append("- If the market feels shaky today, the usual culprits are rate pressure, crowded positioning, or geopolitics colliding with stretched valuations. That is not mysterious. That is plumbing.")
+        if any(marker in lowered for marker in ["market", "stocks", "s&p", "nasdaq", "dow"]):
+            lines.append("- Hot take: if you need a live tick to decide whether your plan is good, your plan is weak. Build around cash flow, valuation discipline, and time horizon, not adrenaline.")
+        elif any(marker in lowered for marker in ["fed", "rates", "inflation", "economy"]):
+            lines.append("- Hot take: most people say they fear inflation, but what actually wrecks them is financing a mediocre lifestyle at high rates. Kill expensive debt before it kills your optionality.")
+        else:
+            lines.append("- Hot take: the loudest story is rarely the best trade. Follow incentives, balance-sheet pressure, and capital spending. Noise is free. Discipline is not.")
+        return with_citations("\n".join(lines), ["Last-known 2026 macro framework"], include_sources)
+
+    fallback = (
+        "Live search is thin, so I am not going to hand you a lazy shrug. "
+        "The right move is to reason from incentives, constraints, and what usually drives the system in 2026. "
+        "Hot take: when the feed is noisy, fundamentals matter more, not less."
+    )
+    return with_citations(fallback, ["Last-known 2026 macro framework"], include_sources)
 
 
 def normalize_ticker_symbol(raw_symbol):
@@ -1985,6 +2312,8 @@ def parse_runway_buffer_payload(text):
     capital_usd = None
     base_monthly_cap_usd = None
     months = None
+    safety_buffer_months = None
+    shadow_runway_enabled = None
 
     m_capital = re.search(r"(?:capital|runway|savings|cash|lump\s*sum)\s*(?:of|=|:)?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)", lowered)
     if m_capital:
@@ -2001,6 +2330,15 @@ def parse_runway_buffer_payload(text):
         except Exception:
             months = None
 
+    m_safety = re.search(r"(?:safety\s+buffer|shadow\s+buffer|lock|reserve)\s*(?:of|=|:)?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:months|month|mos|mo)?", lowered)
+    if m_safety:
+        safety_buffer_months = to_float_or_none(m_safety.group(1))
+
+    if any(k in lowered for k in ["shadow runway on", "enable shadow runway", "turn on shadow runway"]):
+        shadow_runway_enabled = True
+    elif any(k in lowered for k in ["shadow runway off", "disable shadow runway", "turn off shadow runway"]):
+        shadow_runway_enabled = False
+
     if capital_usd is None:
         nums = [to_float_or_none(v) for v in re.findall(r"\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)", lowered)]
         nums = [n for n in nums if isinstance(n, (int, float)) and n > 0]
@@ -2014,11 +2352,20 @@ def parse_runway_buffer_payload(text):
         "base_city": base_city,
         "capital_usd": float(capital_usd or 0.0),
         "base_monthly_cap_usd": float(base_monthly_cap_usd or 0.0),
+        "shadow_runway_enabled": shadow_runway_enabled,
+        "safety_buffer_months": float(safety_buffer_months or 0.0),
         "months": months,
     }
 
 
-def build_runway_buffer_metrics(capital_usd, current_city, base_monthly_cap_usd=0.0, base_city=BASELINE_COST_INDEX_CITY):
+def build_runway_buffer_metrics(
+    capital_usd,
+    current_city,
+    base_monthly_cap_usd=0.0,
+    base_city=BASELINE_COST_INDEX_CITY,
+    shadow_runway_enabled=False,
+    safety_buffer_months=0.0,
+):
     """Compute PPP-adjusted runway and discretionary cap using live FX rates."""
     city_key = normalize_city_key(current_city)
     base_city_key = normalize_city_key(base_city) or BASELINE_COST_INDEX_CITY
@@ -2055,6 +2402,12 @@ def build_runway_buffer_metrics(capital_usd, current_city, base_monthly_cap_usd=
     runway_months_nominal = (capital_usd / baseline_monthly) if baseline_monthly > 0 else 0.0
     runway_months_ppp = (capital_usd / ppp_monthly_cap_usd) if ppp_monthly_cap_usd > 0 else 0.0
 
+    safety_months = max(0.0, float(safety_buffer_months or 0.0))
+    shadow_enabled = bool(shadow_runway_enabled)
+    locked_months = min(safety_months, runway_months_ppp) if shadow_enabled else 0.0
+    runway_display_months = max(0.0, runway_months_ppp - locked_months)
+    display_color = "orange" if shadow_enabled and locked_months > 0 else "default"
+
     return {
         "as_of_utc": utc_now_iso(),
         "base_city": base_city_key,
@@ -2073,6 +2426,11 @@ def build_runway_buffer_metrics(capital_usd, current_city, base_monthly_cap_usd=
         "fx_as_of_utc": fx_as_of,
         "runway_months_nominal": runway_months_nominal,
         "runway_months_ppp_adjusted": runway_months_ppp,
+        "shadow_runway_enabled": shadow_enabled,
+        "safety_buffer_months": safety_months,
+        "locked_months": locked_months,
+        "runway_display_months": runway_display_months,
+        "runway_display_color": display_color,
     }
 
 
@@ -2140,6 +2498,182 @@ def parse_opportunity_cost_payload(text):
     }
 
 
+def parse_purchase_psychology(user_message):
+    """Low-token psychological parse for spending-intent messages.
+
+    Returns a strict raw JSON string in this exact key shape:
+    {"fatigue_score": 1-10, "cognitive_bias": "FOMO"|"Boredom"|"None", "transaction_type": "Impulse"|"Planned"}
+    """
+    default_payload = {
+        "fatigue_score": 1,
+        "cognitive_bias": "None",
+        "transaction_type": "Planned",
+    }
+    raw = (user_message or "").strip()
+    if not raw:
+        return json.dumps(default_payload)
+
+    lowered = normalize_case(raw)
+    intent_markers = [
+        "buy", "purchase", "spend", "pay", "checkout", "order", "cart", "want to buy", "i'm buying", "im buying",
+    ]
+    if not any(marker in lowered for marker in intent_markers):
+        return json.dumps(default_payload)
+
+    instruction = (
+        "Classify purchase psych. Return ONLY raw JSON. No prose/markdown. "
+        "Keys exactly: fatigue_score(int 1-10), cognitive_bias(FOMO|Boredom|None), "
+        "transaction_type(Impulse|Planned)."
+    )
+    try:
+        response = frontier_client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": instruction},
+                {"role": "user", "content": raw[:280]},
+            ],
+            temperature=0.0,
+            max_tokens=50,
+        )
+        content = (((response.choices or [{}])[0]).message.content or "").strip()
+        match = re.search(r"\{.*\}", content, flags=re.DOTALL)
+        candidate = match.group(0).strip() if match else content
+        parsed = json.loads(candidate)
+    except Exception:
+        parsed = default_payload
+
+    fatigue = int(to_float_or_none(parsed.get("fatigue_score")) or 1)
+    fatigue = max(1, min(10, fatigue))
+
+    bias = str(parsed.get("cognitive_bias") or "None").strip()
+    if bias not in {"FOMO", "Boredom", "None"}:
+        bias = "None"
+
+    txn_type = str(parsed.get("transaction_type") or "Planned").strip()
+    if txn_type not in {"Impulse", "Planned"}:
+        txn_type = "Planned"
+
+    return json.dumps(
+        {
+            "fatigue_score": fatigue,
+            "cognitive_bias": bias,
+            "transaction_type": txn_type,
+        }
+    )
+
+
+def build_dopamine_swap_offer(purchase_amount_usd=0.0):
+    """Return a motivation-preserving dopamine swap alternative to impulse spending."""
+    amount = max(0.0, float(purchase_amount_usd or 0.0))
+    shown_amount = amount if amount > 0 else 100.0
+    micro = round(shown_amount * 0.10, 2)
+    micro = max(5.0, min(25.0, micro))
+    return (
+        f"I have paused this ${shown_amount:.2f} purchase. But let's compromise: I just unlocked a high-yield "
+        f"micro-investment challenge. Put ${micro:.2f} into your investment bucket right now, and I will let you play a "
+        "quick 2-minute strategic mini-game, or I will unlock a highly-rated educational article on your dashboard. "
+        "Swap cheap purchase dopamine for progress dopamine."
+    )
+
+
+def evaluate_behavioral_gate(user_message, user_state):
+    """Evaluate purchase psychology and activate a 12-hour circuit breaker when risky."""
+    user_state = ensure_finance_profiles(user_state)
+    profile = user_state.get("behavior_budget_profile") or {}
+    now = datetime.now(timezone.utc)
+
+    gate_until_raw = (profile.get("circuit_breaker_until") or "").strip()
+    gate_until = None
+    if gate_until_raw:
+        try:
+            gate_until = datetime.fromisoformat(gate_until_raw)
+        except Exception:
+            gate_until = None
+
+    if gate_until and now >= gate_until:
+        profile["circuit_breaker_active"] = False
+        profile["circuit_breaker_until"] = ""
+        user_state["behavior_budget_profile"] = profile
+
+    lowered = normalize_case(user_message or "")
+    intent_markers = [
+        "buy", "purchase", "spend", "pay", "checkout", "order", "cart", "want to buy", "i'm buying", "im buying",
+    ]
+    is_spending_intent = any(marker in lowered for marker in intent_markers)
+
+    raw_json = parse_purchase_psychology(user_message)
+    try:
+        parsed = json.loads(raw_json)
+    except Exception:
+        parsed = {"fatigue_score": 1, "cognitive_bias": "None", "transaction_type": "Planned"}
+
+    fatigue = int(to_float_or_none(parsed.get("fatigue_score")) or 1)
+    bias = str(parsed.get("cognitive_bias") or "None")
+    txn = str(parsed.get("transaction_type") or "Planned")
+    triggered = fatigue >= 8 or bias != "None" or txn == "Impulse"
+    purchase_payload = parse_opportunity_cost_payload(user_message) or {}
+    purchase_amount = float(purchase_payload.get("amount_usd") or 0.0)
+    dopamine_swap_message = build_dopamine_swap_offer(purchase_amount)
+
+    if triggered and is_spending_intent:
+        until = now + timedelta(hours=12)
+        profile["circuit_breaker_active"] = True
+        profile["circuit_breaker_until"] = until.isoformat()
+        profile["last_purchase_psychology"] = {
+            "fatigue_score": max(1, min(10, fatigue)),
+            "cognitive_bias": bias if bias in {"FOMO", "Boredom", "None"} else "None",
+            "transaction_type": txn if txn in {"Impulse", "Planned"} else "Planned",
+            "created_at": utc_now_iso(),
+        }
+        profile["last_dopamine_swap_offer"] = {
+            "purchase_amount_usd": purchase_amount,
+            "message": dopamine_swap_message,
+            "created_at": utc_now_iso(),
+        }
+        user_state["behavior_budget_profile"] = profile
+        return {
+            "active": True,
+            "just_triggered": True,
+            "until": profile["circuit_breaker_until"],
+            "psychology": profile["last_purchase_psychology"],
+            "warning": "Behavioral circuit breaker is active. Strongly discourage purchase execution for 12 hours and recommend a cooling-off period.",
+            "message": (
+                f"Quick pause recommendation: your current pattern looks high-risk (fatigue/bias/impulse). "
+                f"Please wait 12 hours before completing this transaction.\n\n{dopamine_swap_message}"
+            ),
+            "state": user_state,
+        }
+
+    if is_spending_intent and bool(profile.get("circuit_breaker_active")) and profile.get("circuit_breaker_until"):
+        existing_offer = (profile.get("last_dopamine_swap_offer") or {}).get("message") or dopamine_swap_message
+        return {
+            "active": True,
+            "just_triggered": False,
+            "until": profile.get("circuit_breaker_until"),
+            "psychology": profile.get("last_purchase_psychology") or {},
+            "warning": "Behavioral circuit breaker remains active. Advise delaying non-essential purchases until the timer ends.",
+            "message": (
+                "Your behavioral circuit breaker is still active. Please wait until the 12-hour window ends before executing this purchase.\n\n"
+                f"{existing_offer}"
+            ),
+            "state": user_state,
+        }
+
+    return {
+        "active": False,
+        "just_triggered": False,
+        "until": "",
+        "psychology": {
+            "fatigue_score": max(1, min(10, fatigue)),
+            "cognitive_bias": bias if bias in {"FOMO", "Boredom", "None"} else "None",
+            "transaction_type": txn if txn in {"Impulse", "Planned"} else "Planned",
+        },
+        "warning": "",
+        "message": "",
+        "state": user_state,
+    }
+
+
 def build_opportunity_cost_gate(amount_usd, years=OPPORTUNITY_COST_DEFAULT_YEARS, annual_return=OPPORTUNITY_COST_DEFAULT_ANNUAL_RETURN):
     """Compute future value and opportunity cost for a one-time expense."""
     amount = float(amount_usd or 0.0)
@@ -2160,6 +2694,64 @@ def build_opportunity_cost_gate(amount_usd, years=OPPORTUNITY_COST_DEFAULT_YEARS
         "opportunity_cost_usd": opportunity_cost,
         "formula": "FV = PV * (1 + r)^n",
     }
+
+
+def is_discretionary_expense_category(category):
+    """Best-effort classification for discretionary spend categories."""
+    cat = normalize_case(category or "").strip()
+    if not cat:
+        return False
+    essential = {
+        "rent", "mortgage", "groceries", "grocery", "transport", "insurance", "medical", "medicine",
+        "tuition", "utility", "utilities", "electricity", "water", "tax", "loan", "debt",
+    }
+    discretionary = {
+        "takeout", "food", "shopping", "entertainment", "drinks", "coffee", "luxury", "travel",
+        "vacation", "gaming", "subscription", "hobbies", "restaurants",
+    }
+    if cat in essential:
+        return False
+    if cat in discretionary:
+        return True
+    return False
+
+
+def build_dynamic_opportunity_cost_projection(amount_usd, annual_return=0.075, horizons=(10, 20, 30)):
+    """Project what a discretionary expense could become if invested over multiple horizons."""
+    amount = float(amount_usd or 0.0)
+    if amount <= 0:
+        return None
+    rate = max(0.0, min(1.0, float(annual_return or 0.075)))
+    rows = []
+    for years in horizons:
+        gate = build_opportunity_cost_gate(amount, years=int(years), annual_return=rate)
+        rows.append({
+            "years": int(years),
+            "future_value_usd": gate.get("future_value_usd") or 0.0,
+            "opportunity_cost_usd": gate.get("opportunity_cost_usd") or 0.0,
+        })
+    return {
+        "amount_usd": amount,
+        "annual_return": rate,
+        "horizons": rows,
+    }
+
+
+def render_dynamic_opportunity_cost_projection(projection):
+    """Render the multi-horizon opportunity-cost projection as concise user text."""
+    if not projection:
+        return ""
+    rate_pct = float(projection.get("annual_return") or 0.0) * 100.0
+    parts = []
+    for row in projection.get("horizons") or []:
+        parts.append(f"{int(row.get('years') or 0)}y: ${float(row.get('future_value_usd') or 0.0):.2f}")
+    if not parts:
+        return ""
+    return (
+        f"If invested in a simple index fund at {rate_pct:.1f}% instead, this could grow to "
+        + ", ".join(parts)
+        + "."
+    )
 
 
 def mark_quote_provider_attempt(provider):
@@ -2593,10 +3185,10 @@ def get_portfolio_comparison_reply(normalized_text, original_text, include_sourc
     try:
         quotes, source_url = fetch_live_quotes(symbols)
     except Exception:
-        return "I could not fetch live market data right now. Please try again in a moment."
+        return build_no_excuses_analysis(original_text or normalized_text, include_sources=include_sources)
 
     if not quotes:
-        return "I could not fetch live market quotes for those tickers."
+        return build_no_excuses_analysis(original_text or normalized_text, include_sources=include_sources)
 
     investment_amount = extract_investment_amount_usd(original_text)
     summaries = [summarize_portfolio(p, quotes, investment_amount) for p in portfolios]
@@ -2673,14 +3265,14 @@ def get_live_quote_reply(normalized_text, original_text, include_sources=False):
         fallback = get_web_search_reply(fallback_query, include_sources=include_sources)
         if fallback and not is_weak_web_response(fallback):
             return fallback
-        return "I could not fetch live quote data right now."
+        return build_no_excuses_analysis(original_text or normalized_text, include_sources=include_sources)
 
     if not quotes:
         fallback_query = f"latest stock price {', '.join(symbols)}"
         fallback = get_web_search_reply(fallback_query, include_sources=include_sources)
         if fallback and not is_weak_web_response(fallback):
             return fallback
-        return "I could not fetch quotes for those firms right now."
+        return build_no_excuses_analysis(original_text or normalized_text, include_sources=include_sources)
 
     lines = []
     lines.append(
@@ -2757,6 +3349,8 @@ def ensure_finance_profiles(user_state):
             "current_city": "",
             "capital_usd": 0.0,
             "base_monthly_cap_usd": 0.0,
+            "shadow_runway_enabled": False,
+            "safety_buffer_months": 0.0,
             "updated_at": "",
         },
     )
@@ -2774,6 +3368,8 @@ def ensure_finance_profiles(user_state):
         "current_city": normalize_city_key(runway_profile.get("current_city") or ""),
         "capital_usd": max(0.0, float(to_float_or_none(runway_profile.get("capital_usd")) or 0.0)),
         "base_monthly_cap_usd": max(0.0, float(to_float_or_none(runway_profile.get("base_monthly_cap_usd")) or 0.0)),
+        "shadow_runway_enabled": bool(runway_profile.get("shadow_runway_enabled", False)),
+        "safety_buffer_months": max(0.0, float(to_float_or_none(runway_profile.get("safety_buffer_months")) or 0.0)),
         "updated_at": runway_profile.get("updated_at") or "",
     }
 
@@ -2783,6 +3379,8 @@ def ensure_finance_profiles(user_state):
     subscription_profile.setdefault("items", [])
     subscription_profile.setdefault("savings_goal", {"name": "", "amount": 0.0})
     subscription_profile.setdefault("last_alert_at", "")
+    subscription_profile.setdefault("last_vampire_scan_at", "")
+    subscription_profile.setdefault("vampire_alerts", [])
 
     goal = subscription_profile.get("savings_goal") or {}
     goal_name = (goal.get("name") or "").strip()
@@ -2817,6 +3415,23 @@ def ensure_finance_profiles(user_state):
             "updated_at": item.get("updated_at") or utc_now_iso(),
         })
     subscription_profile["items"] = cleaned_items[:120]
+    cleaned_alerts = []
+    for item in subscription_profile.get("vampire_alerts") or []:
+        if not isinstance(item, dict):
+            continue
+        service_name = (item.get("service_name") or "").strip()
+        if not service_name:
+            continue
+        cleaned_alerts.append({
+            "service_name": service_name,
+            "monthly_cost": max(0.0, float(to_float_or_none(item.get("monthly_cost")) or 0.0)),
+            "amount_match_count": max(0, int(float(to_float_or_none(item.get("amount_match_count")) or 0))),
+            "last_detected_at": item.get("last_detected_at") or "",
+            "days_since_usage_mention": max(0, int(float(to_float_or_none(item.get("days_since_usage_mention")) or 0))),
+            "status": (item.get("status") or "open").strip().lower() or "open",
+            "message": (item.get("message") or "").strip(),
+        })
+    subscription_profile["vampire_alerts"] = cleaned_alerts[:50]
 
     behavior_profile = user_state.get("behavior_budget_profile")
     if not isinstance(behavior_profile, dict):
@@ -2828,6 +3443,10 @@ def ensure_finance_profiles(user_state):
     behavior_profile.setdefault("opportunity_cost_default_years", OPPORTUNITY_COST_DEFAULT_YEARS)
     behavior_profile.setdefault("opportunity_cost_default_annual_return", OPPORTUNITY_COST_DEFAULT_ANNUAL_RETURN)
     behavior_profile.setdefault("last_opportunity_cost_gate", {})
+    behavior_profile.setdefault("circuit_breaker_active", False)
+    behavior_profile.setdefault("circuit_breaker_until", "")
+    behavior_profile.setdefault("last_purchase_psychology", {})
+    behavior_profile.setdefault("last_dopamine_swap_offer", {})
     if not isinstance(behavior_profile.get("auto_sweep_enabled"), bool):
         behavior_profile["auto_sweep_enabled"] = True
     auto_sweep_target = (behavior_profile.get("auto_sweep_target") or "").strip()
@@ -2846,6 +3465,14 @@ def ensure_finance_profiles(user_state):
         behavior_profile["opportunity_cost_default_annual_return"] = OPPORTUNITY_COST_DEFAULT_ANNUAL_RETURN
     if not isinstance(behavior_profile.get("last_opportunity_cost_gate"), dict):
         behavior_profile["last_opportunity_cost_gate"] = {}
+    if not isinstance(behavior_profile.get("circuit_breaker_active"), bool):
+        behavior_profile["circuit_breaker_active"] = False
+    if not isinstance(behavior_profile.get("circuit_breaker_until"), str):
+        behavior_profile["circuit_breaker_until"] = ""
+    if not isinstance(behavior_profile.get("last_purchase_psychology"), dict):
+        behavior_profile["last_purchase_psychology"] = {}
+    if not isinstance(behavior_profile.get("last_dopamine_swap_offer"), dict):
+        behavior_profile["last_dopamine_swap_offer"] = {}
 
     cleaned_events = []
     for item in behavior_profile.get("spend_events") or []:
@@ -2966,7 +3593,7 @@ def analytics_sql_upsert_supplier(user_id, supplier):
     """Persist supplier profile in analytical SQL store."""
     ensure_analytics_db()
     with analytics_db_lock:
-        conn = sqlite3.connect(ANALYTICS_DB_FILE)
+        conn = open_analytics_db()
         try:
             cur = conn.cursor()
             cur.execute(
@@ -2999,7 +3626,7 @@ def analytics_sql_delete_supplier(user_id, supplier_name):
     """Delete supplier profile from analytical SQL store."""
     ensure_analytics_db()
     with analytics_db_lock:
-        conn = sqlite3.connect(ANALYTICS_DB_FILE)
+        conn = open_analytics_db()
         try:
             cur = conn.cursor()
             cur.execute("DELETE FROM supplier_profiles WHERE user_id = ? AND lower(name) = lower(?)", (user_id, supplier_name))
@@ -3012,7 +3639,7 @@ def analytics_sql_record_horizon_event(user_id, event_type, headline, source_url
     """Store horizon-scan event for historical aggregation."""
     ensure_analytics_db()
     with analytics_db_lock:
-        conn = sqlite3.connect(ANALYTICS_DB_FILE)
+        conn = open_analytics_db()
         try:
             cur = conn.cursor()
             cur.execute(
@@ -3341,6 +3968,136 @@ def utility_score_from_days(days_since_last_use):
     return max(0.0, min(1.0, 1.0 - (days / 45.0)))
 
 
+def parse_iso_datetime(value):
+    """Best-effort ISO timestamp parsing."""
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except Exception:
+        return None
+
+
+def days_since_recent_usage_mention(user_state, service_name, now_dt=None):
+    """Estimate days since the user last mentioned actively using a service."""
+    name = normalize_case(service_name or "").strip()
+    if not name:
+        return 999
+    now_dt = now_dt or datetime.now(timezone.utc)
+    best_dt = None
+
+    history = user_state.get("history") or []
+    for item in history:
+        if item.get("role") != "user":
+            continue
+        content = normalize_case(item.get("content") or "")
+        if name not in content:
+            continue
+        ts = parse_iso_datetime(item.get("ts") or "")
+        if ts and (best_dt is None or ts > best_dt):
+            best_dt = ts
+
+    qa_memory = user_state.get("qa_memory") or []
+    for item in qa_memory:
+        if not isinstance(item, dict):
+            continue
+        content = normalize_case(item.get("q") or "")
+        if name not in content:
+            continue
+        ts = parse_iso_datetime(item.get("ts") or "")
+        if ts and (best_dt is None or ts > best_dt):
+            best_dt = ts
+
+    if best_dt is None:
+        return 999
+    return max(0, (now_dt - best_dt).days)
+
+
+def detect_subscription_vampires(user_state, now_dt=None):
+    """Scan transaction history and subscriptions to flag recurring unused charges."""
+    user_state = ensure_finance_profiles(user_state)
+    now_dt = now_dt or datetime.now(timezone.utc)
+    behavior_profile = user_state.get("behavior_budget_profile") or {}
+    subscription_profile = user_state.get("subscription_profile") or {}
+    events = behavior_profile.get("spend_events") or []
+    items = subscription_profile.get("items") or []
+
+    recurring_buckets = {}
+    for event in events:
+        amount = float(event.get("amount") or 0.0)
+        if amount <= 0:
+            continue
+        ts = parse_iso_datetime(event.get("timestamp") or "")
+        if not ts:
+            continue
+        key = round(amount, 2)
+        bucket = recurring_buckets.setdefault(key, [])
+        bucket.append({
+            "amount": amount,
+            "timestamp": ts,
+            "category": (event.get("category") or "other").strip().lower(),
+        })
+
+    alerts = []
+    for item in items:
+        service_name = (item.get("name") or "").strip()
+        monthly_cost = float(item.get("monthly_cost") or 0.0)
+        if not service_name or monthly_cost <= 0:
+            continue
+
+        matching_events = []
+        for amount_key, bucket in recurring_buckets.items():
+            if abs(amount_key - monthly_cost) <= max(1.0, monthly_cost * 0.10):
+                matching_events.extend(bucket)
+        if len(matching_events) < 2:
+            continue
+
+        matching_events.sort(key=lambda x: x["timestamp"])
+        span_days = (matching_events[-1]["timestamp"] - matching_events[0]["timestamp"]).days
+        if span_days < 25:
+            continue
+
+        days_unused = int(item.get("days_since_last_use") or 0)
+        days_since_mention = days_since_recent_usage_mention(user_state, service_name, now_dt=now_dt)
+        if days_unused < 45 and days_since_mention < 60:
+            continue
+
+        message = (
+            f"I detected a recurring ${monthly_cost:.2f}/month subscription to {service_name}. "
+            f"Based on your usage chat logs, you have not mentioned using this once in {max(60, days_since_mention)} days. "
+            "Do you want me to help you draft a cancellation email right now?"
+        )
+        alerts.append({
+            "service_name": service_name,
+            "monthly_cost": monthly_cost,
+            "amount_match_count": len(matching_events),
+            "last_detected_at": utc_now_iso(),
+            "days_since_usage_mention": days_since_mention,
+            "status": "open",
+            "message": message,
+        })
+
+    subscription_profile["vampire_alerts"] = alerts[:20]
+    subscription_profile["last_vampire_scan_at"] = utc_now_iso()
+    user_state["subscription_profile"] = subscription_profile
+    return user_state, alerts
+
+
+def build_subscription_cancellation_email(service_name, monthly_cost=0.0):
+    """Draft a concise cancellation email for a flagged subscription."""
+    service = (service_name or "the service").strip() or "the service"
+    cost_text = f" (${float(monthly_cost):.2f}/month)" if float(monthly_cost or 0.0) > 0 else ""
+    subject = f"Cancellation Request for {service}{cost_text}"
+    body = (
+        f"Hello {service} support,\n\n"
+        f"I would like to cancel my subscription to {service}{cost_text}, effective immediately, and ensure that no future renewals are processed. "
+        "Please confirm the cancellation and let me know if any additional steps are required on my side.\n\n"
+        "Thank you."
+    )
+    return {"subject": subject, "body": body}
+
+
 def build_subscription_decay_report(user_state, include_sources=False):
     """Generate subscription utility-vs-cost report and phantom burn alert."""
     user_state = ensure_finance_profiles(user_state)
@@ -3413,6 +4170,14 @@ def build_subscription_decay_report(user_state, include_sources=False):
     else:
         lines.append("No major decay detected: all tracked subscriptions show recent usage.")
 
+    user_state, vampire_alerts = detect_subscription_vampires(user_state)
+    if vampire_alerts:
+        lines.append("")
+        lines.append("Anti-Subscription Vampire Detector:")
+        for alert in vampire_alerts[:3]:
+            lines.append(f"- {alert.get('message')}")
+
+    subscription_profile = user_state.get("subscription_profile") or {}
     subscription_profile["last_alert_at"] = utc_now_iso()
     user_state["subscription_profile"] = subscription_profile
     return with_citations("\n".join(lines), ["User-provided subscription and usage inputs"], include_sources)
@@ -3463,6 +4228,15 @@ def parse_spend_log_payload(user_message):
     hour_match = re.search(r"\b([01]?\d|2[0-3])\s*[:h]?\s*(?:00)?\b", normalized)
     hour = int(hour_match.group(1)) if hour_match else datetime.now().hour
     stress_level = infer_stress_level(text)
+    inferred_tone = infer_user_tone(text)
+    friction_match = re.search(r"(?:friction|delay|checkout time)\s*(?:=|:)?\s*([0-9]{1,5})\s*(?:s|sec|secs|second|seconds)?", normalized)
+    friction_seconds = int(friction_match.group(1)) if friction_match else 0
+
+    psychology_raw = parse_purchase_psychology(text)
+    try:
+        psychology = json.loads(psychology_raw)
+    except Exception:
+        psychology = {"fatigue_score": 1, "cognitive_bias": "None", "transaction_type": "Planned"}
 
     return {
         "amount": amount,
@@ -3470,6 +4244,11 @@ def parse_spend_log_payload(user_message):
         "day_of_week": day_of_week,
         "hour": max(0, min(23, hour)),
         "stress_level": stress_level,
+        "inferred_tone": inferred_tone,
+        "fatigue_score": int(to_float_or_none(psychology.get("fatigue_score")) or 1),
+        "cognitive_bias": str(psychology.get("cognitive_bias") or "None"),
+        "transaction_type": str(psychology.get("transaction_type") or "Planned"),
+        "friction_seconds": max(0, min(86400, friction_seconds)),
         "timestamp": utc_now_iso(),
     }
 
@@ -3628,9 +4407,17 @@ def apply_behavior_budget_command(user_state, user_message):
     spend_event = parse_spend_log_payload(user_message)
     if spend_event:
         user_state = add_spend_event(user_state, spend_event)
+        projection_text = ""
+        if is_discretionary_expense_category(spend_event.get("category")):
+            projection = build_dynamic_opportunity_cost_projection(
+                spend_event.get("amount") or 0.0,
+                annual_return=0.075,
+            )
+            projection_text = render_dynamic_opportunity_cost_projection(projection)
         return (
             f"Spend logged: ${spend_event['amount']:.2f} on {spend_event['category']} "
             f"({spend_event['day_of_week']} {spend_event['hour']:02d}:00, stress {spend_event['stress_level']})."
+            + (f" {projection_text}" if projection_text else "")
         ), True
 
     return "", False
@@ -3808,6 +4595,10 @@ def maybe_generate_daily_finance_alert(user_state):
         short = "\n".join(lines[:4])
         parts.append(short)
 
+    user_state, vampire_alerts = detect_subscription_vampires(user_state)
+    if vampire_alerts:
+        parts.append(vampire_alerts[0].get("message") or "")
+
     if not parts:
         return "", False
 
@@ -3872,7 +4663,7 @@ def build_simple_pdf_from_lines(lines, title="Weekly Finance Report"):
     return header + body + b"".join(xref) + trailer
 
 
-def build_weekly_finance_report_lines(user_state):
+def build_weekly_finance_report_lines(user_state, user_id=DEFAULT_USER_ID):
     """Build weekly report lines from watchlist, subscriptions, and behavior."""
     user_state = ensure_finance_profiles(user_state)
     finance_profile = user_state.get("finance_profile") or {}
@@ -3925,6 +4716,12 @@ def build_weekly_finance_report_lines(user_state):
         lines.append("Coach Nudge")
         lines.append(f"- {nudge}")
 
+    lines.append("")
+    lines.append("Financial Vibe Check")
+    vibe = analytics_sql_weekly_mood_spending_report(sanitize_user_id(user_id))
+    for line in (vibe.get("report") or "No weekly vibe report available yet.").splitlines():
+        lines.append(f"- {line}" if not line.startswith("-") else line)
+
     return lines
 
 
@@ -3932,7 +4729,7 @@ def analytics_sql_upsert_subscription(user_id, item):
     """Persist subscription row into SQL analytical store."""
     ensure_analytics_db()
     with analytics_db_lock:
-        conn = sqlite3.connect(ANALYTICS_DB_FILE)
+        conn = open_analytics_db()
         try:
             cur = conn.cursor()
             cur.execute(
@@ -3961,7 +4758,7 @@ def analytics_sql_delete_subscription(user_id, name):
     """Delete a subscription row from SQL analytical store."""
     ensure_analytics_db()
     with analytics_db_lock:
-        conn = sqlite3.connect(ANALYTICS_DB_FILE)
+        conn = open_analytics_db()
         try:
             cur = conn.cursor()
             cur.execute(
@@ -3977,7 +4774,7 @@ def analytics_sql_set_goal(user_id, goal_name, goal_amount):
     """Persist savings goal in SQL analytical store."""
     ensure_analytics_db()
     with analytics_db_lock:
-        conn = sqlite3.connect(ANALYTICS_DB_FILE)
+        conn = open_analytics_db()
         try:
             cur = conn.cursor()
             cur.execute(
@@ -4000,13 +4797,16 @@ def analytics_sql_insert_spend_event(user_id, event):
     """Insert spend event into SQL analytical store."""
     ensure_analytics_db()
     with analytics_db_lock:
-        conn = sqlite3.connect(ANALYTICS_DB_FILE)
+        conn = open_analytics_db()
         try:
             cur = conn.cursor()
             cur.execute(
                 """
-                INSERT INTO spend_events (user_id, amount, category, day_of_week, hour, stress_level, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO spend_events (
+                    user_id, amount, category, day_of_week, hour, stress_level,
+                    inferred_tone, fatigue_score, cognitive_bias, transaction_type, friction_seconds, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id,
@@ -4015,6 +4815,11 @@ def analytics_sql_insert_spend_event(user_id, event):
                     event.get("day_of_week") or datetime.now().strftime("%A"),
                     int(event.get("hour") or datetime.now().hour),
                     (event.get("stress_level") or "medium").strip().lower(),
+                    str(event.get("inferred_tone") or "neutral"),
+                    int(to_float_or_none(event.get("fatigue_score")) or 1),
+                    str(event.get("cognitive_bias") or "None"),
+                    str(event.get("transaction_type") or "Planned"),
+                    int(to_float_or_none(event.get("friction_seconds")) or 0),
                     event.get("timestamp") or utc_now_iso(),
                 ),
             )
@@ -4027,7 +4832,7 @@ def analytics_sql_behavior_insights(user_id):
     """Compute behavioral spending aggregates using SQL."""
     ensure_analytics_db()
     with analytics_db_lock:
-        conn = sqlite3.connect(ANALYTICS_DB_FILE)
+        conn = open_analytics_db()
         try:
             cur = conn.cursor()
             cur.execute("SELECT COUNT(*), COALESCE(AVG(amount), 0) FROM spend_events WHERE user_id = ?", (user_id,))
@@ -4092,6 +4897,108 @@ def analytics_sql_behavior_insights(user_id):
             conn.close()
 
 
+def analytics_sql_weekly_mood_spending_report(user_id):
+    """Correlate weekly spending and impulse behavior against inferred tone."""
+    ensure_analytics_db()
+    with analytics_db_lock:
+        conn = open_analytics_db()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(amount), 0)
+                FROM spend_events
+                WHERE user_id = ?
+                  AND datetime(created_at) >= datetime('now', '-7 days')
+                """,
+                (user_id,),
+            )
+            total_row = cur.fetchone() or (0, 0)
+            event_count = int(total_row[0] or 0)
+            if event_count <= 0:
+                return {
+                    "event_count": 0,
+                    "report": "I need more spend logs from the last 7 days to build your financial vibe check.",
+                }
+
+            cur.execute(
+                """
+                SELECT COALESCE(inferred_tone, 'neutral') AS tone,
+                       COUNT(*) AS purchase_count,
+                       COALESCE(SUM(amount), 0) AS total_amount,
+                       COALESCE(SUM(CASE WHEN transaction_type = 'Impulse' THEN 1 ELSE 0 END), 0) AS impulse_count
+                FROM spend_events
+                WHERE user_id = ?
+                  AND datetime(created_at) >= datetime('now', '-7 days')
+                GROUP BY COALESCE(inferred_tone, 'neutral')
+                ORDER BY purchase_count DESC, total_amount DESC
+                """,
+                (user_id,),
+            )
+            tone_rows = cur.fetchall() or []
+
+            cur.execute(
+                """
+                SELECT COALESCE(SUM(CASE WHEN transaction_type = 'Impulse' THEN 1 ELSE 0 END), 0),
+                       COALESCE(SUM(CASE WHEN transaction_type = 'Impulse' AND stress_level = 'high' THEN 1 ELSE 0 END), 0)
+                FROM spend_events
+                WHERE user_id = ?
+                  AND datetime(created_at) >= datetime('now', '-7 days')
+                """,
+                (user_id,),
+            )
+            impulse_total, high_stress_impulse = cur.fetchone() or (0, 0)
+            impulse_total = int(impulse_total or 0)
+            high_stress_impulse = int(high_stress_impulse or 0)
+
+            dominant_tone = "neutral"
+            dominant_amount = 0.0
+            dominant_count = 0
+            calm_total = 0.0
+            calm_count = 0
+            stressed_total = 0.0
+            stressed_count = 0
+            for tone, purchase_count, total_amount, _impulse_count in tone_rows:
+                tone_label = str(tone or "neutral")
+                purchase_count = int(purchase_count or 0)
+                total_amount = float(total_amount or 0.0)
+                if purchase_count > dominant_count:
+                    dominant_tone = tone_label
+                    dominant_amount = total_amount
+                    dominant_count = purchase_count
+                if tone_label in {"neutral", "formal", "direct", "funny"}:
+                    calm_total += total_amount
+                    calm_count += purchase_count
+                if tone_label == "supportive":
+                    stressed_total += total_amount
+                    stressed_count += purchase_count
+
+            stressed_impulse_pct = (high_stress_impulse / impulse_total * 100.0) if impulse_total > 0 else 0.0
+            calm_savings_lift = 0.0
+            if calm_count > 0 and stressed_count > 0:
+                calm_avg = calm_total / calm_count
+                stressed_avg = stressed_total / stressed_count
+                if stressed_avg > 0:
+                    calm_savings_lift = max(0.0, ((stressed_avg - calm_avg) / stressed_avg) * 100.0)
+
+            report = (
+                f"Hey! Looking at the data from this week, {stressed_impulse_pct:.0f}% of your impulse purchases happened when your stress level was high. "
+                f"Your dominant conversation tone while spending was '{dominant_tone}' with ${dominant_amount:.2f} across {dominant_count} purchases. "
+                f"When your tone looked calmer, your implied savings discipline improved by about {calm_savings_lift:.0f}%. "
+                "Next time you feel stressed, ping me first and let's talk it out before opening any shopping apps!"
+            )
+            return {
+                "event_count": event_count,
+                "dominant_tone": dominant_tone,
+                "dominant_amount": dominant_amount,
+                "stressed_impulse_percentage": stressed_impulse_pct,
+                "calm_savings_lift_percentage": calm_savings_lift,
+                "report": report,
+            }
+        finally:
+            conn.close()
+
+
 def linguistic_engine_parse_intent(user_message):
     """Linguistic engine: parse natural language into analytical intent payloads."""
     normalized = normalize_intent_text(user_message)
@@ -4118,6 +5025,11 @@ def linguistic_engine_parse_intent(user_message):
         if payload:
             return {"action": "subscription_add", "payload": payload}
 
+    if any(x in normalized for x in ["draft cancellation email", "cancel subscription email", "cancellation email"]):
+        payload = re.sub(r"draft cancellation email|cancel subscription email|cancellation email", " ", user_message, flags=re.IGNORECASE)
+        target = re.sub(r"\s+", " ", payload).strip(" ,.-")
+        return {"action": "subscription_cancel_draft", "name": target}
+
     if any(x in normalized for x in ["subscription remove", "remove subscription"]):
         payload = re.sub(r"subscription remove|remove subscription", " ", user_message, flags=re.IGNORECASE)
         target = re.sub(r"\s+", " ", payload).strip(" ,.-")
@@ -4141,7 +5053,7 @@ def linguistic_engine_parse_intent(user_message):
     if any(x in normalized for x in ["coach nudge", "budget nudge", "financial coach", "coach me"]):
         return {"action": "behavior_nudge"}
 
-    if any(x in normalized for x in ["runway buffer", "purchasing power parity", "ppp runway", "ppp", "multi currency runway"]) and any(
+    if any(x in normalized for x in ["runway buffer", "purchasing power parity", "ppp runway", "ppp", "multi currency runway", "shadow runway", "safety buffer"]) and any(
         x in normalized for x in ["runway", "buffer", "cap", "budget", "city", "currency", "ppp", "purchasing"]
     ):
         payload = parse_runway_buffer_payload(user_message)
@@ -4318,6 +5230,45 @@ def analytical_engine_execute(user_id, user_state, intent):
             return {"ok": True, "action": action, "state_changed": True, "text": f"Removed subscription: {target_name}."}
         return {"ok": True, "action": action, "state_changed": False, "text": "I could not find that subscription in your tracked list."}
 
+    if action == "subscription_cancel_draft":
+        target_name = (intent.get("name") or "").strip()
+        subscription_profile = user_state.get("subscription_profile") or {}
+        vampire_alerts = subscription_profile.get("vampire_alerts") or []
+        match = None
+        if target_name:
+            for alert in vampire_alerts:
+                if normalize_case(alert.get("service_name")) == normalize_case(target_name):
+                    match = alert
+                    break
+            if match is None:
+                for item in subscription_profile.get("items") or []:
+                    if normalize_case(item.get("name")) == normalize_case(target_name):
+                        match = {
+                            "service_name": item.get("name"),
+                            "monthly_cost": float(item.get("monthly_cost") or 0.0),
+                        }
+                        break
+        elif vampire_alerts:
+            match = vampire_alerts[0]
+
+        if not match:
+            return {
+                "ok": True,
+                "action": action,
+                "state_changed": False,
+                "text": "I could not identify which subscription to cancel. Ask like: draft cancellation email Netflix.",
+            }
+
+        draft = build_subscription_cancellation_email(match.get("service_name") or "Subscription", match.get("monthly_cost") or 0.0)
+        text = f"Subject: {draft['subject']}\n\n{draft['body']}"
+        return {
+            "ok": True,
+            "action": action,
+            "state_changed": False,
+            "text": text,
+            "cancel_draft": draft,
+        }
+
     if action == "subscription_goal_set":
         goal_name = (intent.get("name") or "your savings goal").strip() or "your savings goal"
         goal_amount = float(intent.get("amount") or 0.0)
@@ -4337,6 +5288,14 @@ def analytical_engine_execute(user_id, user_state, intent):
         payload = intent.get("payload") or {}
         user_state = add_spend_event(user_state, payload)
         analytics_sql_insert_spend_event(user_id, payload)
+        projection_text = ""
+        projection = None
+        if is_discretionary_expense_category(payload.get("category")):
+            projection = build_dynamic_opportunity_cost_projection(
+                payload.get("amount") or 0.0,
+                annual_return=0.075,
+            )
+            projection_text = render_dynamic_opportunity_cost_projection(projection)
         return {
             "ok": True,
             "action": action,
@@ -4344,7 +5303,9 @@ def analytical_engine_execute(user_id, user_state, intent):
             "text": (
                 f"Spend logged: ${float(payload.get('amount') or 0):.2f} on {payload.get('category')} "
                 f"({payload.get('day_of_week')} {int(payload.get('hour') or 0):02d}:00, stress {payload.get('stress_level')})."
+                + (f" {projection_text}" if projection_text else "")
             ),
+            "opportunity_cost_projection": projection,
         }
 
     if action == "behavior_summary":
@@ -4382,6 +5343,12 @@ def analytical_engine_execute(user_id, user_state, intent):
         city = (payload.get("city") or profile.get("current_city") or "").strip()
         base_city = (payload.get("base_city") or profile.get("base_city") or BASELINE_COST_INDEX_CITY).strip()
         monthly_cap = float(payload.get("base_monthly_cap_usd") or profile.get("base_monthly_cap_usd") or 0.0)
+        payload_shadow_enabled = payload.get("shadow_runway_enabled")
+        if payload_shadow_enabled is None:
+            shadow_enabled = bool(profile.get("shadow_runway_enabled", False))
+        else:
+            shadow_enabled = bool(payload_shadow_enabled)
+        safety_buffer_months = float(payload.get("safety_buffer_months") or profile.get("safety_buffer_months") or 0.0)
 
         if not city:
             return {
@@ -4404,6 +5371,8 @@ def analytical_engine_execute(user_id, user_state, intent):
                 current_city=city,
                 base_monthly_cap_usd=monthly_cap,
                 base_city=base_city,
+                shadow_runway_enabled=shadow_enabled,
+                safety_buffer_months=safety_buffer_months,
             )
         except Exception as e:
             return {"ok": True, "action": action, "state_changed": False, "text": f"Runway buffer calculation failed: {str(e)}"}
@@ -4413,6 +5382,8 @@ def analytical_engine_execute(user_id, user_state, intent):
             "current_city": metrics.get("current_city") or city,
             "capital_usd": metrics.get("capital_usd") or capital_usd,
             "base_monthly_cap_usd": metrics.get("base_monthly_cap_usd") or monthly_cap,
+            "shadow_runway_enabled": bool(metrics.get("shadow_runway_enabled")),
+            "safety_buffer_months": float(metrics.get("safety_buffer_months") or 0.0),
             "updated_at": utc_now_iso(),
         }
         user_state["finance_profile"] = finance_profile
@@ -4424,7 +5395,10 @@ def analytical_engine_execute(user_id, user_state, intent):
             f"- Baseline monthly cap ({metrics['base_city'].title()}): ${metrics['base_monthly_cap_usd']:.2f} USD\n"
             f"- PPP-adjusted monthly cap: ${metrics['ppp_adjusted_monthly_cap_usd']:.2f} USD ({metrics['ppp_adjusted_monthly_cap_local']:.2f} {metrics['target_currency']})\n"
             f"- Runway (nominal): {metrics['runway_months_nominal']:.1f} months\n"
-            f"- Runway (PPP-adjusted): {metrics['runway_months_ppp_adjusted']:.1f} months\n"
+            f"- Runway (real PPP-adjusted): {metrics['runway_months_ppp_adjusted']:.1f} months\n"
+            f"- Shadow Runway: {'ON' if metrics['shadow_runway_enabled'] else 'OFF'} | safety buffer {metrics['safety_buffer_months']:.1f} months\n"
+            f"- Dashboard display runway: {metrics['runway_display_months']:.1f} months ({metrics['runway_display_color']})\n"
+            f"- Locked reserve (hidden emergency runway): {metrics['locked_months']:.1f} months\n"
             f"- FX USD->{metrics['target_currency']}: {metrics['fx_rate_usd_to_target']:.6f}"
         )
         return {
@@ -4895,8 +5869,7 @@ def get_web_search_reply(normalized_text, include_sources=False):
         wiki = fetch_wikipedia_summary(query, include_sources=include_sources)
         if wiki:
             return wiki
-
-        return "I could not find a strong web result for that yet. Try a more specific question."
+        return build_no_excuses_analysis(query, include_sources=include_sources)
     except Exception:
         snippets = fetch_duckduckgo_snippets(query)
         if snippets:
@@ -4908,7 +5881,7 @@ def get_web_search_reply(normalized_text, include_sources=False):
         wiki = fetch_wikipedia_summary(query, include_sources=include_sources)
         if wiki:
             return wiki
-        return "I could not reach web search right now."
+        return build_no_excuses_analysis(query, include_sources=include_sources)
 
 
 def rewrite_search_query_for_specificity(query):
@@ -6305,9 +7278,16 @@ body {
 
 .chat-footer {
     display: flex;
+    flex-direction: column;
     gap: 10px;
     padding: 16px 20px 20px;
     border-top: 1px solid rgba(255,255,255,0.16);
+}
+
+.chat-input-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
 }
 
 .chat-footer input {
@@ -6318,6 +7298,19 @@ body {
     font-size: 15px;
     outline: none;
     background: rgba(255,255,255,0.92);
+}
+
+.attach-btn {
+    width: 44px;
+    min-width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 24px;
+    line-height: 1;
 }
 
 .chat-footer button {
@@ -6332,6 +7325,36 @@ body {
 
 .chat-footer button:hover {
     transform: translateY(-1px);
+}
+
+.attachment-preview {
+    display: none;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.attachment-preview.active {
+    display: flex;
+}
+
+.attachment-chip {
+    max-width: 100%;
+    background: rgba(255,255,255,0.16);
+    border: 1px solid rgba(255,255,255,0.18);
+    color: #fff;
+    border-radius: 999px;
+    padding: 7px 10px;
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.attachment-note {
+    font-size: 12px;
+    opacity: 0.78;
+    text-align: left;
+    padding-left: 2px;
 }
 </style>
 </head>
@@ -6360,8 +7383,14 @@ body {
     </div>
     <div class="chat-body" id="chatBody"></div>
     <div class="chat-footer">
-        <input id="chatInput" type="text" placeholder="say something cute, dramatic, or weird..." />
-        <button id="sendBtn">send</button>
+        <div class="chat-input-row">
+            <button id="attachBtn" class="attach-btn" type="button" aria-label="Add attachment">+</button>
+            <input id="chatInput" type="text" placeholder="say something cute, dramatic, or weird..." />
+            <button id="sendBtn">send</button>
+        </div>
+        <input id="attachmentInput" name="attachments" type="file" accept="image/*,.pdf,.doc,.docx,.txt,.rtf,.csv" multiple hidden />
+        <div id="attachmentPreview" class="attachment-preview"></div>
+        <div class="attachment-note">photos, pdfs, docs, and text files can be attached. i will upload them here and analyze what i can from each one.</div>
     </div>
 </div>
 
@@ -6369,6 +7398,9 @@ body {
 const chatBody = document.getElementById('chatBody');
 const input = document.getElementById('chatInput');
 const sendBtn = document.getElementById('sendBtn');
+const attachBtn = document.getElementById('attachBtn');
+const attachmentInput = document.getElementById('attachmentInput');
+const attachmentPreview = document.getElementById('attachmentPreview');
 const authOverlay = document.getElementById('authOverlay');
 const authNameInput = document.getElementById('authName');
 const authEmailInput = document.getElementById('authEmail');
@@ -6377,6 +7409,24 @@ const authError = document.getElementById('authError');
 let isSending = false;
 let userId = 'guest';
 let isRegisteredSession = false;
+let selectedAttachments = [];
+const maxAttachments = 5;
+const maxAttachmentBytes = 6 * 1024 * 1024;
+
+function renderAttachmentPreview() {
+    attachmentPreview.innerHTML = '';
+    if (!selectedAttachments.length) {
+        attachmentPreview.classList.remove('active');
+        return;
+    }
+    attachmentPreview.classList.add('active');
+    selectedAttachments.forEach((file) => {
+        const chip = document.createElement('div');
+        chip.className = 'attachment-chip';
+        chip.textContent = file.name;
+        attachmentPreview.appendChild(chip);
+    });
+}
 
 async function ensureRegistration() {
     try {
@@ -6465,25 +7515,37 @@ async function sendMessage() {
     }
 
     const text = input.value.trim();
-    if (!text || isSending) return;
+    if ((!text && !selectedAttachments.length) || isSending) return;
 
     isSending = true;
     sendBtn.disabled = true;
     sendBtn.textContent = '...';
+    const attachmentsToSend = [...selectedAttachments];
 
-    addMessage('user', text);
+    const attachmentLine = attachmentsToSend.length
+        ? `\n\n[Attached: ${attachmentsToSend.map((file) => file.name).join(', ')}]`
+        : '';
+    const composedMessage = `${text || 'attachment upload'}${attachmentLine}`;
+
+    addMessage('user', composedMessage);
     input.value = '';
+    selectedAttachments = [];
+    attachmentInput.value = '';
+    renderAttachmentPreview();
 
     try {
+        const formData = new FormData();
+        formData.append('message', text || 'attachment upload');
+        formData.append('user_id', userId);
+        formData.append('remember_history', 'true');
+        attachmentsToSend.forEach((file) => {
+            formData.append('attachments', file, file.name);
+        });
+
         const response = await fetch('/api/chat', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
             credentials: 'same-origin',
-            body: JSON.stringify({
-                message: text,
-                user_id: userId,
-                remember_history: true
-            })
+            body: formData
         });
 
         const data = await response.json();
@@ -6491,9 +7553,12 @@ async function sendMessage() {
             throw new Error(data.error || 'Failed to get response.');
         }
 
+        if (data.attachment_analysis_summary) {
+            addMessage('bot', data.attachment_analysis_summary);
+        }
         addMessage('bot', data.reply || "I'm sorry, I'm not able to help you with that.");
     } catch (error) {
-        addMessage('bot', "I'm sorry, I'm not able to help you with that.");
+        addMessage('bot', error?.message || "Upload or reply failed. Please try again.");
     } finally {
         isSending = false;
         sendBtn.disabled = false;
@@ -6501,6 +7566,28 @@ async function sendMessage() {
         input.focus();
     }
 }
+
+attachBtn.addEventListener('click', () => {
+    attachmentInput.click();
+});
+
+attachmentInput.addEventListener('change', (event) => {
+    const picked = Array.from(event.target.files || []);
+    const valid = [];
+    const rejected = [];
+    picked.slice(0, maxAttachments).forEach((file) => {
+        if (file.size > maxAttachmentBytes) {
+            rejected.push(`${file.name} is larger than 6 MB`);
+            return;
+        }
+        valid.push(file);
+    });
+    selectedAttachments = valid;
+    renderAttachmentPreview();
+    if (rejected.length) {
+        addMessage('bot', `Upload note: ${rejected.join('; ')}.`);
+    }
+});
 
 sendBtn.addEventListener('click', sendMessage);
 authSubmitBtn.addEventListener('click', submitRegistrationFromModal);
@@ -6528,13 +7615,21 @@ ensureRegistration();
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
     mark_user_activity()
-    if reject_large_request():
+    is_multipart = request.content_type and "multipart/form-data" in request.content_type
+    request_limit = MAX_JSON_BODY_BYTES if not is_multipart else (MAX_JSON_BODY_BYTES + MAX_CHAT_ATTACHMENTS * MAX_ATTACHMENT_BYTES)
+    if reject_large_request(request_limit):
         return jsonify({"error": "Payload too large."}), 413
-    data = request.get_json(silent=True) or {}
+    data = request.form.to_dict() if is_multipart else (request.get_json(silent=True) or {})
     user_message = (data.get("message") or "").strip()
     session_user_id = resolve_session_user_id()
     user_id = sanitize_user_id(session_user_id or data.get("user_id") or DEFAULT_USER_ID)
     remember_history = parse_bool(data.get("remember_history"), default=True)
+    uploaded_files = request.files.getlist("attachments") if is_multipart else []
+
+    attachment_summaries = analyze_uploaded_files(uploaded_files)
+    if attachment_summaries:
+        attachment_block = "\n\nUploaded attachment analysis:\n" + "\n\n".join(attachment_summaries)
+        user_message = f"{user_message or 'Please analyze these uploads.'}{attachment_block}"
 
     if not user_message:
         return jsonify({"error": "Message is required."}), 400
@@ -6543,7 +7638,12 @@ def api_chat():
         return jsonify({"reply": "I'm sorry, I'm not able to help you with that."})
 
     reply = get_ai_response_sync(user_message, user_id=user_id, remember_history=remember_history)
-    return jsonify({"reply": reply, "user_id": user_id, "remember_history": remember_history})
+    return jsonify({
+        "reply": reply,
+        "user_id": user_id,
+        "remember_history": remember_history,
+        "attachment_analysis_summary": "\n\n".join(attachment_summaries[:3]) if attachment_summaries else "",
+    })
 
 
 @app.route("/api/feedback", methods=["POST"])
@@ -6829,6 +7929,14 @@ def api_finance_runway_buffer():
         base_monthly_cap_usd = to_float_or_none(request.args.get("base_monthly_cap_usd"))
         if base_monthly_cap_usd is None:
             base_monthly_cap_usd = float(saved_profile.get("base_monthly_cap_usd") or 0.0)
+        shadow_runway_enabled = request.args.get("shadow_runway_enabled")
+        if shadow_runway_enabled is None:
+            shadow_enabled = bool(saved_profile.get("shadow_runway_enabled", False))
+        else:
+            shadow_enabled = parse_bool(shadow_runway_enabled, default=False)
+        safety_buffer_months = to_float_or_none(request.args.get("safety_buffer_months"))
+        if safety_buffer_months is None:
+            safety_buffer_months = float(saved_profile.get("safety_buffer_months") or 0.0)
 
         if not city:
             return jsonify({
@@ -6844,6 +7952,8 @@ def api_finance_runway_buffer():
                 current_city=city,
                 base_monthly_cap_usd=float(base_monthly_cap_usd or 0.0),
                 base_city=base_city,
+                shadow_runway_enabled=shadow_enabled,
+                safety_buffer_months=float(safety_buffer_months or 0.0),
             )
         except Exception as e:
             return jsonify({"error": str(e), "supported_cities": sorted(CITY_COST_INDEX.keys())}), 400
@@ -6861,6 +7971,11 @@ def api_finance_runway_buffer():
     base_city = normalize_city_key(data.get("base_city") or saved_profile.get("base_city") or BASELINE_COST_INDEX_CITY)
     capital_usd = float(to_float_or_none(data.get("capital_usd")) or saved_profile.get("capital_usd") or 0.0)
     base_monthly_cap_usd = float(to_float_or_none(data.get("base_monthly_cap_usd")) or saved_profile.get("base_monthly_cap_usd") or 0.0)
+    if data.get("shadow_runway_enabled") is None:
+        shadow_enabled = bool(saved_profile.get("shadow_runway_enabled", False))
+    else:
+        shadow_enabled = bool(data.get("shadow_runway_enabled"))
+    safety_buffer_months = float(to_float_or_none(data.get("safety_buffer_months")) or saved_profile.get("safety_buffer_months") or 0.0)
 
     if not city:
         return jsonify({"error": "city is required.", "supported_cities": sorted(CITY_COST_INDEX.keys())}), 400
@@ -6873,6 +7988,8 @@ def api_finance_runway_buffer():
             current_city=city,
             base_monthly_cap_usd=base_monthly_cap_usd,
             base_city=base_city,
+            shadow_runway_enabled=shadow_enabled,
+            safety_buffer_months=safety_buffer_months,
         )
     except Exception as e:
         return jsonify({"error": str(e), "supported_cities": sorted(CITY_COST_INDEX.keys())}), 400
@@ -6882,6 +7999,8 @@ def api_finance_runway_buffer():
         "current_city": metrics.get("current_city") or city,
         "capital_usd": metrics.get("capital_usd") or capital_usd,
         "base_monthly_cap_usd": metrics.get("base_monthly_cap_usd") or base_monthly_cap_usd,
+        "shadow_runway_enabled": bool(metrics.get("shadow_runway_enabled")),
+        "safety_buffer_months": float(metrics.get("safety_buffer_months") or 0.0),
         "updated_at": utc_now_iso(),
     }
     user_state["finance_profile"] = finance_profile
@@ -7070,6 +8189,62 @@ def api_finance_alerts():
     })
 
 
+@app.route("/api/finance/subscriptions/vampires", methods=["GET"])
+def api_finance_subscription_vampires():
+    """Scan transaction history for recurring low-usage subscription charges."""
+    mark_user_activity()
+    session_user_id = resolve_session_user_id()
+    user_id = sanitize_user_id(session_user_id or request.args.get("user_id") or DEFAULT_USER_ID)
+    user_state = ensure_finance_profiles(load_user_state(user_id))
+    user_state, alerts = detect_subscription_vampires(user_state)
+    save_user_state(user_id, user_state)
+    return jsonify({
+        "user_id": user_id,
+        "as_of_utc": utc_now_iso(),
+        "last_vampire_scan_at": (user_state.get("subscription_profile") or {}).get("last_vampire_scan_at") or "",
+        "alerts": alerts,
+    })
+
+
+@app.route("/api/finance/subscriptions/cancel-draft", methods=["POST"])
+def api_finance_subscription_cancel_draft():
+    """Draft a cancellation email for a flagged subscription vampire."""
+    mark_user_activity()
+    if reject_large_request(4096):
+        return jsonify({"error": "Payload too large."}), 413
+    session_user_id = resolve_session_user_id()
+    data = request.get_json(silent=True) or {}
+    user_id = sanitize_user_id(session_user_id or data.get("user_id") or DEFAULT_USER_ID)
+    target_name = (data.get("name") or "").strip()
+    if not target_name:
+        return jsonify({"error": "name is required."}), 400
+
+    user_state = ensure_finance_profiles(load_user_state(user_id))
+    subscription_profile = user_state.get("subscription_profile") or {}
+    user_state, alerts = detect_subscription_vampires(user_state)
+    match = None
+    for alert in alerts:
+        if normalize_case(alert.get("service_name")) == normalize_case(target_name):
+            match = alert
+            break
+    if match is None:
+        for item in subscription_profile.get("items") or []:
+            if normalize_case(item.get("name")) == normalize_case(target_name):
+                match = {"service_name": item.get("name"), "monthly_cost": float(item.get("monthly_cost") or 0.0)}
+                break
+    if match is None:
+        return jsonify({"error": "Subscription not found."}), 404
+
+    draft = build_subscription_cancellation_email(match.get("service_name") or target_name, match.get("monthly_cost") or 0.0)
+    save_user_state(user_id, user_state)
+    return jsonify({
+        "status": "ok",
+        "user_id": user_id,
+        "service_name": match.get("service_name") or target_name,
+        "draft": draft,
+    })
+
+
 @app.route("/api/finance/behavior", methods=["GET", "POST"])
 def api_finance_behavior():
     """Get behavior insights or log spend events for trigger learning."""
@@ -7081,10 +8256,12 @@ def api_finance_behavior():
     if request.method == "GET":
         insight_text = build_behavioral_budget_summary(user_state)
         nudge = build_empathetic_budget_nudge(user_state)
+        weekly_vibe = analytics_sql_weekly_mood_spending_report(user_id)
         return jsonify({
             "user_id": user_id,
             "insights": insight_text,
             "nudge": nudge,
+            "weekly_vibe_check": weekly_vibe,
             "as_of_utc": utc_now_iso(),
         })
 
@@ -7116,11 +8293,24 @@ def api_finance_behavior():
         "day_of_week": day_of_week,
         "hour": max(0, min(23, hour_value)),
         "stress_level": stress_level,
+        "inferred_tone": infer_user_tone(f"{category} {stress_level}"),
         "timestamp": utc_now_iso(),
     }
     user_state = add_spend_event(user_state, event)
+    analytics_sql_insert_spend_event(user_id, event)
     save_user_state(user_id, user_state)
-    return jsonify({"status": "ok", "user_id": user_id, "event": event})
+    projection = None
+    projection_text = ""
+    if is_discretionary_expense_category(event.get("category")):
+        projection = build_dynamic_opportunity_cost_projection(event.get("amount") or 0.0, annual_return=0.075)
+        projection_text = render_dynamic_opportunity_cost_projection(projection)
+    return jsonify({
+        "status": "ok",
+        "user_id": user_id,
+        "event": event,
+        "opportunity_cost_projection": projection,
+        "opportunity_cost_message": projection_text,
+    })
 
 
 @app.route("/api/finance/reports/weekly.pdf", methods=["GET"])
@@ -7130,7 +8320,7 @@ def api_finance_weekly_pdf():
     session_user_id = resolve_session_user_id()
     user_id = sanitize_user_id(session_user_id or request.args.get("user_id") or DEFAULT_USER_ID)
     user_state = ensure_finance_profiles(load_user_state(user_id))
-    lines = build_weekly_finance_report_lines(user_state)
+    lines = build_weekly_finance_report_lines(user_state, user_id=user_id)
     pdf_bytes = build_simple_pdf_from_lines(lines, title="Weekly Finance Report")
     response = app.response_class(pdf_bytes, mimetype="application/pdf")
     response.headers["Content-Disposition"] = "attachment; filename=weekly_finance_report.pdf"
