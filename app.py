@@ -182,11 +182,51 @@ def decrypt_sensitive_state_fields(state):
             upgrade_needed = True
     return hydrated, upgrade_needed
 finance_provider_health = {
-    "yahoo": {"last_attempt": "", "last_success": "", "last_error": "", "success_count": 0, "error_count": 0},
-    "stooq": {"last_attempt": "", "last_success": "", "last_error": "", "success_count": 0, "error_count": 0},
-    "alpha_vantage": {"last_attempt": "", "last_success": "", "last_error": "", "success_count": 0, "error_count": 0},
+    "yahoo": {
+        "last_attempt": "",
+        "last_success": "",
+        "last_error": "",
+        "last_error_type": "",
+        "last_error_http_status": 0,
+        "cooldown_until": "",
+        "cooldown_reason": "",
+        "last_skip": "",
+        "success_count": 0,
+        "error_count": 0,
+        "skip_count": 0,
+    },
+    "stooq": {
+        "last_attempt": "",
+        "last_success": "",
+        "last_error": "",
+        "last_error_type": "",
+        "last_error_http_status": 0,
+        "cooldown_until": "",
+        "cooldown_reason": "",
+        "last_skip": "",
+        "success_count": 0,
+        "error_count": 0,
+        "skip_count": 0,
+    },
+    "alpha_vantage": {
+        "last_attempt": "",
+        "last_success": "",
+        "last_error": "",
+        "last_error_type": "",
+        "last_error_http_status": 0,
+        "cooldown_until": "",
+        "cooldown_reason": "",
+        "last_skip": "",
+        "success_count": 0,
+        "error_count": 0,
+        "skip_count": 0,
+    },
 }
 FINANCE_QUOTE_CACHE_TTL_SECONDS = int(os.getenv("FINANCE_QUOTE_CACHE_TTL_SECONDS", "60"))
+QUOTE_PROVIDER_BASE_COOLDOWN_SECONDS = int(os.getenv("QUOTE_PROVIDER_BASE_COOLDOWN_SECONDS", "90"))
+QUOTE_PROVIDER_RATE_LIMIT_COOLDOWN_SECONDS = int(os.getenv("QUOTE_PROVIDER_RATE_LIMIT_COOLDOWN_SECONDS", "300"))
+QUOTE_PROVIDER_AUTH_COOLDOWN_SECONDS = int(os.getenv("QUOTE_PROVIDER_AUTH_COOLDOWN_SECONDS", "900"))
+QUOTE_PROVIDER_NOT_FOUND_COOLDOWN_SECONDS = int(os.getenv("QUOTE_PROVIDER_NOT_FOUND_COOLDOWN_SECONDS", "300"))
 FX_RATE_CACHE_TTL_SECONDS = int(os.getenv("FX_RATE_CACHE_TTL_SECONDS", "3600"))
 OPPORTUNITY_COST_THRESHOLD_USD = float(os.getenv("OPPORTUNITY_COST_THRESHOLD_USD", "100"))
 OPPORTUNITY_COST_DEFAULT_YEARS = int(os.getenv("OPPORTUNITY_COST_DEFAULT_YEARS", "10"))
@@ -4099,15 +4139,87 @@ def mark_quote_provider_success(provider):
         bucket = finance_provider_health.setdefault(provider, {})
         bucket["last_success"] = utc_now_iso()
         bucket["last_error"] = ""
+        bucket["last_error_type"] = ""
+        bucket["last_error_http_status"] = 0
+        bucket["cooldown_until"] = ""
+        bucket["cooldown_reason"] = ""
         bucket["success_count"] = int(bucket.get("success_count", 0)) + 1
+
+
+def classify_provider_error(err):
+    """Classify provider error to drive cooldown behavior and operator diagnostics."""
+    message = (str(err) or "error").strip()
+    lowered = normalize_case(message)
+    status = 0
+    m = re.search(r"http\s+error\s+(\d{3})", lowered)
+    if m:
+        try:
+            status = int(m.group(1))
+        except Exception:
+            status = 0
+
+    if status == 429 or "rate limit" in lowered or "too many requests" in lowered:
+        return "rate_limit", status
+    if status in {401, 403} or "unauthorized" in lowered or "forbidden" in lowered:
+        return "auth", status
+    if status == 404 or "not found" in lowered:
+        return "not_found", status
+    if "timed out" in lowered or "timeout" in lowered:
+        return "timeout", status
+    if "temporary failure" in lowered or "connection reset" in lowered:
+        return "network", status
+    return "unknown", status
+
+
+def provider_cooldown_seconds(error_type):
+    """Map error type to a cautious cooldown duration."""
+    if error_type == "rate_limit":
+        return max(30, QUOTE_PROVIDER_RATE_LIMIT_COOLDOWN_SECONDS)
+    if error_type == "auth":
+        return max(60, QUOTE_PROVIDER_AUTH_COOLDOWN_SECONDS)
+    if error_type == "not_found":
+        return max(60, QUOTE_PROVIDER_NOT_FOUND_COOLDOWN_SECONDS)
+    return max(30, QUOTE_PROVIDER_BASE_COOLDOWN_SECONDS)
 
 
 def mark_quote_provider_error(provider, err):
     """Update provider health metrics for a failed response."""
+    error_type, http_status = classify_provider_error(err)
+    cooldown_seconds = provider_cooldown_seconds(error_type)
+    cooldown_until = (datetime.now(timezone.utc) + timedelta(seconds=cooldown_seconds)).isoformat()
+
     with finance_cache_lock:
         bucket = finance_provider_health.setdefault(provider, {})
         bucket["last_error"] = (str(err) or "error")[:300]
+        bucket["last_error_type"] = error_type
+        bucket["last_error_http_status"] = int(http_status or 0)
+        bucket["cooldown_until"] = cooldown_until
+        bucket["cooldown_reason"] = f"{error_type}:{http_status or 'n/a'}"
         bucket["error_count"] = int(bucket.get("error_count", 0)) + 1
+
+
+def get_provider_cooldown_state(provider):
+    """Return whether provider is in cooldown and metadata for diagnostics."""
+    with finance_cache_lock:
+        bucket = finance_provider_health.setdefault(provider, {})
+        until_raw = str(bucket.get("cooldown_until") or "")
+        reason = str(bucket.get("cooldown_reason") or "")
+    until_dt = parse_iso_datetime(until_raw)
+    if not until_dt:
+        return False, 0, reason
+    now_dt = datetime.now(timezone.utc)
+    remaining = int((until_dt - now_dt).total_seconds())
+    if remaining <= 0:
+        return False, 0, reason
+    return True, remaining, reason
+
+
+def mark_quote_provider_skipped(provider, reason):
+    """Track provider skips (e.g., cooldown) for observability."""
+    with finance_cache_lock:
+        bucket = finance_provider_health.setdefault(provider, {})
+        bucket["last_skip"] = f"{utc_now_iso()}::{reason[:180]}"
+        bucket["skip_count"] = int(bucket.get("skip_count", 0)) + 1
 
 
 def fetch_yahoo_quotes(symbols):
@@ -4295,48 +4407,63 @@ def fetch_live_quotes(symbols):
         remaining = list(missing)
 
         # Provider 1: Yahoo Finance
-        mark_quote_provider_attempt("yahoo")
-        try:
-            yahoo_quotes, yahoo_source = fetch_yahoo_quotes(remaining)
-            if yahoo_source:
-                used_sources.append(yahoo_source)
-            quotes.update(yahoo_quotes)
-            if yahoo_quotes:
-                mark_quote_provider_success("yahoo")
-        except Exception as e:
-            mark_quote_provider_error("yahoo", e)
+        yahoo_blocked, yahoo_left, yahoo_reason = get_provider_cooldown_state("yahoo")
+        if yahoo_blocked:
+            mark_quote_provider_skipped("yahoo", f"cooldown:{yahoo_left}s:{yahoo_reason}")
+        else:
+            mark_quote_provider_attempt("yahoo")
+            try:
+                yahoo_quotes, yahoo_source = fetch_yahoo_quotes(remaining)
+                if yahoo_source:
+                    used_sources.append(yahoo_source)
+                quotes.update(yahoo_quotes)
+                if yahoo_quotes:
+                    mark_quote_provider_success("yahoo")
+            except Exception as e:
+                mark_quote_provider_error("yahoo", e)
         remaining = [s for s in remaining if s not in quotes]
 
         # Provider 2: Stooq fallback
         if remaining:
-            mark_quote_provider_attempt("stooq")
-            try:
-                stooq_quotes, stooq_source = fetch_stooq_quotes(remaining)
-                if stooq_source:
-                    used_sources.append(stooq_source)
-                for symbol, quote in stooq_quotes.items():
-                    if symbol not in quotes:
-                        quotes[symbol] = quote
-                if stooq_quotes:
-                    mark_quote_provider_success("stooq")
-            except Exception as e:
-                mark_quote_provider_error("stooq", e)
+            stooq_blocked, stooq_left, stooq_reason = get_provider_cooldown_state("stooq")
+            if stooq_blocked:
+                mark_quote_provider_skipped("stooq", f"cooldown:{stooq_left}s:{stooq_reason}")
+            else:
+                mark_quote_provider_attempt("stooq")
+                try:
+                    stooq_quotes, stooq_source = fetch_stooq_quotes(remaining)
+                    if stooq_source:
+                        used_sources.append(stooq_source)
+                    for symbol, quote in stooq_quotes.items():
+                        if symbol not in quotes:
+                            quotes[symbol] = quote
+                    if stooq_quotes:
+                        mark_quote_provider_success("stooq")
+                except Exception as e:
+                    mark_quote_provider_error("stooq", e)
         remaining = [s for s in remaining if s not in quotes]
 
         # Provider 3: Alpha Vantage fallback (optional API key)
-        if remaining and ALPHA_VANTAGE_API_KEY:
-            mark_quote_provider_attempt("alpha_vantage")
-            try:
-                av_quotes, av_source = fetch_alpha_vantage_quotes(remaining)
-                if av_source:
-                    used_sources.append(av_source)
-                for symbol, quote in av_quotes.items():
-                    if symbol not in quotes:
-                        quotes[symbol] = quote
-                if av_quotes:
-                    mark_quote_provider_success("alpha_vantage")
-            except Exception as e:
-                mark_quote_provider_error("alpha_vantage", e)
+        if remaining:
+            if not ALPHA_VANTAGE_API_KEY:
+                mark_quote_provider_skipped("alpha_vantage", "disabled:no-api-key")
+            else:
+                av_blocked, av_left, av_reason = get_provider_cooldown_state("alpha_vantage")
+                if av_blocked:
+                    mark_quote_provider_skipped("alpha_vantage", f"cooldown:{av_left}s:{av_reason}")
+                else:
+                    mark_quote_provider_attempt("alpha_vantage")
+                    try:
+                        av_quotes, av_source = fetch_alpha_vantage_quotes(remaining)
+                        if av_source:
+                            used_sources.append(av_source)
+                        for symbol, quote in av_quotes.items():
+                            if symbol not in quotes:
+                                quotes[symbol] = quote
+                        if av_quotes:
+                            mark_quote_provider_success("alpha_vantage")
+                    except Exception as e:
+                        mark_quote_provider_error("alpha_vantage", e)
 
         now_cached_at = time.time()
         with finance_cache_lock:
@@ -10214,6 +10341,14 @@ def api_finance_provider_health():
     with finance_cache_lock:
         health = json.loads(json.dumps(finance_provider_health))
         cache_size = len(finance_quote_cache)
+
+    for provider, bucket in health.items():
+        active, remaining, reason = get_provider_cooldown_state(provider)
+        bucket["cooldown_active"] = bool(active)
+        bucket["cooldown_seconds_remaining"] = int(remaining)
+        if not bucket.get("cooldown_reason") and reason:
+            bucket["cooldown_reason"] = reason
+
     return jsonify({
         "as_of_utc": utc_now_iso(),
         "cache_ttl_seconds": FINANCE_QUOTE_CACHE_TTL_SECONDS,
