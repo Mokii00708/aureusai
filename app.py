@@ -2137,6 +2137,138 @@ def apply_financial_traceability_guard(user_message, assistant_message, source_t
     )
     return UNVERIFIED_FINANCIAL_CLAIM_MESSAGE
 
+
+def detect_high_stress_finance_context(text):
+    """Detect emotionally loaded finance messages that require human-first handling."""
+    lowered = normalize_case(text or "")
+
+    hardship = bool(
+        re.search(
+            r"\b(can'?t\s+pay|cannot\s+pay|missed\s+(rent|payment)|behind\s+on\s+(rent|bills?)|"
+            r"late\s+on\s+rent|evict|eviction|rent\s+this\s+month|overdue\s+bill|shut\s*off\s+notice)\b",
+            lowered,
+        )
+    )
+
+    loss_distress = bool(
+        re.search(
+            r"\b(lost\s+(a\s+lot|money)|bad\s+trade|blew\s+up\s+my\s+account|wiped\s+out|"
+            r"i\s+feel\s+like\s+an?\s+(idiot|failure|moron)|i\s+screwed\s+up|i\s+messed\s+up)\b",
+            lowered,
+        )
+    )
+
+    peer_source = bool(
+        re.search(r"\b(friend|buddy|coworker|influencer|tiktok|youtube|discord|telegram|reddit|twitter|x)\b", lowered)
+    )
+    hype_claim = bool(
+        re.search(
+            r"\b(10x|100x|guaranteed\s+return|sure\s+thing|can't\s+lose|cannot\s+lose|to\s+the\s+moon|"
+            r"inside\s+tip|all\s+in|put\s+all\s+my\s+savings)\b",
+            lowered,
+        )
+    )
+    investment_scope = bool(re.search(r"\b(crypto|bitcoin|eth|stock|stocks|option|options|trading|invest|investment|savings)\b", lowered))
+    peer_hype = (peer_source and hype_claim and investment_scope) or bool(
+        re.search(r"\b(all\s+my\s+savings\s+into\s+crypto)\b", lowered)
+    )
+
+    is_flagged = hardship or loss_distress or peer_hype
+    return {
+        "is_flagged": is_flagged,
+        "hardship": hardship,
+        "loss_distress": loss_distress,
+        "peer_hype": peer_hype,
+    }
+
+
+def _high_stress_opening(context):
+    """Return a plain-language acknowledgment opener for high-stress finance messages."""
+    if context.get("hardship"):
+        return "That is a stressful spot, and you are doing the right thing by dealing with it early."
+    if context.get("loss_distress"):
+        return "That is a rough hit, and feeling shaken after a loss like that is normal."
+    if context.get("peer_hype"):
+        return "Good call asking before acting because hype-based money advice can get expensive fast."
+    return "This is a high-pressure money decision, so let us slow it down and handle it clearly."
+
+
+def has_high_stress_acknowledgment(reply_text):
+    """Check whether the first 1-2 sentences acknowledge the user's situation."""
+    text = (reply_text or "").strip()
+    if not text:
+        return False
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()]
+    lead = " ".join(parts[:2]) if parts else text
+    return bool(
+        re.search(
+            r"(?i)(rough|stressful|hard\s+spot|you'?re\s+dealing\s+with|good\s+call\s+asking|"
+            r"feeling\s+shaken|you'?re\s+not\s+crazy|you'?re\s+not\s+alone|right\s+thing\s+by\s+asking)",
+            lead,
+        )
+    )
+
+
+def apply_high_stress_tone_check(user_message, assistant_message):
+    """Ensure flagged finance replies acknowledge the person before advice/data."""
+    context = detect_high_stress_finance_context(user_message)
+    if not context.get("is_flagged"):
+        return assistant_message
+    reply = (assistant_message or "").strip()
+    if has_high_stress_acknowledgment(reply):
+        return reply
+    opener = _high_stress_opening(context)
+    if not reply:
+        return opener
+    return f"{opener} {reply}"
+
+
+def get_high_stress_finance_reply(user_message, include_sources=False):
+    """Return concrete guidance for emotionally loaded finance situations."""
+    context = detect_high_stress_finance_context(user_message)
+    if not context.get("is_flagged"):
+        return ""
+
+    if context.get("hardship"):
+        reply = (
+            "That is a stressful spot, and you are doing the right thing by dealing with it early. "
+            "Here is the practical playbook for this week:\n"
+            "1. Contact your landlord today before the due date or as soon as possible. Give a specific amount you can pay now and a realistic date for the rest.\n"
+            "2. Apply immediately for local rental assistance (city/county programs, 211, community nonprofits). Same-day applications matter.\n"
+            "3. Prioritize bills in this order for now: housing, utilities, food, transportation, then unsecured debt.\n"
+            "4. If short on cash, ask utility providers and lenders for hardship plans before missing more payments.\n"
+            "5. Avoid payday/title loans if possible. The interest spiral usually makes next month worse.\n"
+            "If you want, I can help you draft a landlord message in 60 seconds using your exact numbers."
+        )
+        if include_sources:
+            return with_citations(reply, ["https://www.211.org/"], include_sources)
+        return reply
+
+    if context.get("peer_hype"):
+        reply = (
+            "Good call asking before acting because hype-based money advice can get expensive fast. "
+            "I would not put all your savings into a single crypto bet based on a friend or influencer claim.\n"
+            "1. A \"10x soon\" claim is not evidence; it is a red flag unless backed by verifiable data and risk limits.\n"
+            "2. Putting all savings into one volatile asset creates concentration risk and can wipe out emergency money.\n"
+            "3. Keep your safety cash (rent/emergency fund) out of high-volatility bets.\n"
+            "4. If you still want exposure, size it small enough that a full loss does not damage your core finances."
+        )
+        return reply
+
+    if context.get("loss_distress"):
+        reply = (
+            "That is a rough hit, and feeling shaken after a loss like that is normal. "
+            "Let us make the next move safer, not emotional:\n"
+            "1. Pause new risk trades for 48-72 hours.\n"
+            "2. Write down exactly what happened: thesis, entry, size, stop, and what invalidated it.\n"
+            "3. Set hard rules before the next trade: smaller position size, predefined stop, and max daily loss.\n"
+            "4. Protect remaining cash first; recovery starts with risk control, not revenge trading.\n"
+            "If you want, I can help you turn the last trade into a one-page post-mortem and a safer rule set."
+        )
+        return reply
+
+    return ""
+
 def get_ai_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True):
     """Send user message to frontier model and stream response."""
     global conversation_history
@@ -2179,6 +2311,20 @@ def get_ai_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True
         return gate_message
 
     wants_citations = is_citation_request(normalize_intent_text(user_message))
+    high_stress_reply = get_high_stress_finance_reply(user_message, include_sources=wants_citations)
+    if high_stress_reply:
+        high_stress_reply = apply_tone_style(high_stress_reply, user_message)
+        high_stress_reply = apply_high_stress_tone_check(user_message, high_stress_reply)
+        if remember_history:
+            conversation_history.append({"role": "user", "content": user_message})
+            conversation_history.append({"role": "assistant", "content": high_stress_reply})
+            conversation_history = trim_history(conversation_history)
+            user_state = update_autonomous_learning(user_state, user_message, high_stress_reply)
+            user_state["history"] = conversation_history
+        if remember_history or alert_state_changed or sweep_changed:
+            save_user_state(user_id, user_state)
+        return high_stress_reply
+
     finance_direct_reply, finance_changed = get_personal_finance_feature_reply(
         user_message,
         user_state,
@@ -2187,6 +2333,7 @@ def get_ai_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True
     )
     if finance_direct_reply:
         finance_direct_reply = apply_tone_style(finance_direct_reply, user_message)
+        finance_direct_reply = apply_high_stress_tone_check(user_message, finance_direct_reply)
         finance_direct_reply = merge_witty_alert(finance_direct_reply, subscription_alert)
         if remember_history:
             conversation_history.append({"role": "user", "content": user_message})
@@ -2229,6 +2376,7 @@ def get_ai_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True
         
         print()  # Newline after streaming completes
         full_response = apply_tone_style(full_response, user_message)
+        full_response = apply_high_stress_tone_check(user_message, full_response)
         full_response = merge_witty_alert(full_response, subscription_alert)
         full_response = apply_financial_traceability_guard(user_message, full_response, source_tag="llm-stream", user_id=user_id)
         
@@ -2250,6 +2398,7 @@ def get_ai_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True
         if not (assistant_message or "").strip():
             assistant_message = DATA_UNAVAILABLE_RETRY_MESSAGE
         assistant_message = apply_tone_style(assistant_message, user_message)
+        assistant_message = apply_high_stress_tone_check(user_message, assistant_message)
         assistant_message = merge_witty_alert(assistant_message, subscription_alert)
         assistant_message = apply_financial_traceability_guard(user_message, assistant_message, source_tag="local-fallback", user_id=user_id)
         conversation_history.append({"role": "assistant", "content": assistant_message})
@@ -2307,6 +2456,21 @@ def get_ai_response_sync(user_message, user_id=DEFAULT_USER_ID, remember_history
         return gate_message
 
     wants_citations = is_citation_request(normalize_intent_text(user_message))
+    high_stress_reply = get_high_stress_finance_reply(user_message, include_sources=wants_citations)
+    if high_stress_reply:
+        high_stress_reply = apply_tone_style(high_stress_reply, user_message)
+        high_stress_reply = apply_high_stress_tone_check(user_message, high_stress_reply)
+        high_stress_reply = localize_reply(high_stress_reply, target_language)
+        if remember_history:
+            conversation_history.append({"role": "user", "content": user_message})
+            conversation_history.append({"role": "assistant", "content": high_stress_reply})
+            conversation_history = trim_history(conversation_history)
+            user_state = update_autonomous_learning(user_state, user_message, high_stress_reply)
+            user_state["history"] = conversation_history
+        if remember_history or alert_state_changed or sweep_changed:
+            save_user_state(user_id, user_state)
+        return high_stress_reply
+
     finance_direct_reply, finance_changed = get_personal_finance_feature_reply(
         user_message,
         user_state,
@@ -2315,6 +2479,7 @@ def get_ai_response_sync(user_message, user_id=DEFAULT_USER_ID, remember_history
     )
     if finance_direct_reply:
         finance_direct_reply = apply_tone_style(finance_direct_reply, user_message)
+        finance_direct_reply = apply_high_stress_tone_check(user_message, finance_direct_reply)
         finance_direct_reply = localize_reply(finance_direct_reply, target_language)
         finance_direct_reply = merge_witty_alert(finance_direct_reply, subscription_alert)
         if remember_history:
@@ -2379,6 +2544,7 @@ def get_ai_response_sync(user_message, user_id=DEFAULT_USER_ID, remember_history
         if not assistant_message:
             assistant_message = get_local_smart_reply(user_message, user_id=user_id)
         assistant_message = apply_tone_style(assistant_message, user_message)
+        assistant_message = apply_high_stress_tone_check(user_message, assistant_message)
         assistant_message = localize_reply(assistant_message, target_language)
         assistant_message = merge_witty_alert(assistant_message, subscription_alert)
         assistant_message = apply_financial_traceability_guard(user_message, assistant_message, source_tag="llm-sync", user_id=user_id)
@@ -2397,6 +2563,7 @@ def get_ai_response_sync(user_message, user_id=DEFAULT_USER_ID, remember_history
         if not (assistant_message or "").strip():
             assistant_message = DATA_UNAVAILABLE_RETRY_MESSAGE
         assistant_message = apply_tone_style(assistant_message, user_message)
+        assistant_message = apply_high_stress_tone_check(user_message, assistant_message)
         assistant_message = localize_reply(assistant_message, target_language)
         assistant_message = merge_witty_alert(assistant_message, subscription_alert)
         assistant_message = apply_financial_traceability_guard(user_message, assistant_message, source_tag="local-sync-fallback", user_id=user_id)
@@ -8199,6 +8366,10 @@ def get_local_smart_reply(user_message, user_id=DEFAULT_USER_ID):
     original_lower = normalize_case(user_message).strip()
     words = set(re.findall(r"[a-z']+", normalized))
     wants_citations = is_citation_request(normalized)
+
+    high_stress_reply = get_high_stress_finance_reply(user_message, include_sources=wants_citations)
+    if high_stress_reply:
+        return apply_high_stress_tone_check(user_message, high_stress_reply)
 
     if "uploaded attachment analysis:" in original_lower:
         attachment_block = user_message.split("Uploaded attachment analysis:", 1)[-1].strip()
