@@ -1,10 +1,9 @@
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, send_file, jsonify, make_response
 import os
 import json
 import re
 import ast
 import math
-import sqlite3
 import ssl
 import random
 import difflib
@@ -16,11 +15,16 @@ import hashlib
 import hmac
 import base64
 import zipfile
+import bcrypt
+from cryptography.fernet import Fernet, InvalidToken
 from datetime import datetime, timezone, timedelta
 from html import unescape
 from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree as ET
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import QueuePool
 from dotenv import load_dotenv
 from openai import OpenAI
 import tiktoken
@@ -44,26 +48,46 @@ except Exception as e:
 HISTORY_FILE = "history.json"
 DATA_DIR = "data"
 USER_MEMORY_DIR = os.path.join(DATA_DIR, "users")
+UPLOADS_DIR = os.path.join(DATA_DIR, "uploads")
 LEARNING_FILE = os.path.join(DATA_DIR, "learning_memory.json")
 ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
 SESSIONS_FILE = os.path.join(DATA_DIR, "sessions.json")
 ANALYTICS_DB_FILE = os.path.join(DATA_DIR, "analytics_engine.db")
+DATABASE_URL = (
+    (os.getenv("DATABASE_URL") or "").strip()
+    or (os.getenv("ANALYTICS_DATABASE_URL") or "").strip()
+    or f"sqlite:///{ANALYTICS_DB_FILE}"
+)
+
+DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "5"))
+DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "10"))
+DB_POOL_RECYCLE_SECONDS = int(os.getenv("DB_POOL_RECYCLE_SECONDS", "1800"))
+LLM_REQUEST_TIMEOUT_SECONDS = float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "25"))
+DATA_UNAVAILABLE_RETRY_MESSAGE = "Data unavailable right now. Please try again in a moment."
+MARKET_DATA_UNAVAILABLE_RETRY_MESSAGE = "Market data unavailable right now. Please try again in a moment."
 DEFAULT_USER_ID = "guest"
 APP_SECRET = os.getenv("APP_SECRET") or API_KEY
-SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "2592000"))
+ACCESS_TOKEN_TTL_SECONDS = min(86400, int(os.getenv("ACCESS_TOKEN_TTL_SECONDS", "3600")))
+REFRESH_TOKEN_TTL_SECONDS = int(os.getenv("REFRESH_TOKEN_TTL_SECONDS", "604800"))
+DATA_ENCRYPTION_KEY = (os.getenv("DATA_ENCRYPTION_KEY") or "").strip()
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "0") in {"1", "true", "True"}
 MAX_JSON_BODY_BYTES = int(os.getenv("MAX_JSON_BODY_BYTES", "16384"))
 MAX_CHAT_ATTACHMENTS = int(os.getenv("MAX_CHAT_ATTACHMENTS", "5"))
 MAX_ATTACHMENT_BYTES = int(os.getenv("MAX_ATTACHMENT_BYTES", str(6 * 1024 * 1024)))
 AUTH_RATE_LIMIT_WINDOW = int(os.getenv("AUTH_RATE_LIMIT_WINDOW", "300"))
 AUTH_RATE_LIMIT_MAX = int(os.getenv("AUTH_RATE_LIMIT_MAX", "20"))
+CHAT_USER_RATE_LIMIT_WINDOW = int(os.getenv("CHAT_USER_RATE_LIMIT_WINDOW", "300"))
+CHAT_USER_RATE_LIMIT_MAX = int(os.getenv("CHAT_USER_RATE_LIMIT_MAX", "30"))
 AUTO_LEARN_ENABLED = os.getenv("AUTO_LEARN_ENABLED", "1") not in {"0", "false", "False"}
 AUTO_LEARN_INTERVAL_SECONDS = int(os.getenv("AUTO_LEARN_INTERVAL_SECONDS", "900"))
 AUTO_LEARN_IDLE_SECONDS = int(os.getenv("AUTO_LEARN_IDLE_SECONDS", "300"))
 AUTO_LEARN_TOPIC_LIMIT = int(os.getenv("AUTO_LEARN_TOPIC_LIMIT", "3"))
+UPLOAD_RETENTION_DAYS = int(os.getenv("UPLOAD_RETENTION_DAYS", "7"))
+UPLOAD_CLEAN_INTERVAL_SECONDS = int(os.getenv("UPLOAD_CLEAN_INTERVAL_SECONDS", "21600"))
 
 last_user_activity_ts = time.time()
 idle_worker_started = False
+upload_cleanup_worker_started = False
 idle_learning_lock = threading.Lock()
 auth_rate_limit_lock = threading.Lock()
 auth_rate_limit_hits = {}
@@ -71,6 +95,88 @@ analytics_db_lock = threading.Lock()
 finance_cache_lock = threading.Lock()
 finance_quote_cache = {}
 fx_rate_cache = {}
+
+
+def build_state_fernet():
+    """Build a stable Fernet cipher for encrypting persisted user state fields."""
+    raw_key = DATA_ENCRYPTION_KEY
+    if raw_key:
+        candidate = raw_key.encode("utf-8")
+    else:
+        digest = hashlib.sha256((APP_SECRET or "fallback-state-key").encode("utf-8")).digest()
+        candidate = base64.urlsafe_b64encode(digest)
+    try:
+        return Fernet(candidate)
+    except Exception:
+        return None
+
+
+STATE_FERNET = build_state_fernet()
+ENCRYPTED_STATE_VERSION = 1
+SENSITIVE_STATE_FIELDS = {"profile", "finance_profile"}
+
+
+def is_encrypted_payload(value):
+    return isinstance(value, dict) and bool(value.get("__encrypted__")) and isinstance(value.get("token"), str)
+
+
+def encrypt_state_value(value):
+    if STATE_FERNET is None:
+        return value
+    try:
+        plaintext = json.dumps(value, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        token = STATE_FERNET.encrypt(plaintext).decode("utf-8")
+        return {
+            "__encrypted__": True,
+            "alg": "fernet",
+            "v": ENCRYPTED_STATE_VERSION,
+            "token": token,
+        }
+    except Exception:
+        return value
+
+
+def decrypt_state_value(value):
+    if not is_encrypted_payload(value):
+        return value, False
+    token = (value.get("token") or "").strip()
+    if not token or STATE_FERNET is None:
+        return None, False
+    try:
+        plaintext = STATE_FERNET.decrypt(token.encode("utf-8"))
+        return json.loads(plaintext.decode("utf-8")), True
+    except (InvalidToken, ValueError, TypeError, json.JSONDecodeError):
+        return None, False
+    except Exception:
+        return None, False
+
+
+def encrypt_sensitive_state_fields(state):
+    if not isinstance(state, dict):
+        return state
+    serialized = dict(state)
+    for key in SENSITIVE_STATE_FIELDS:
+        raw_value = serialized.get(key)
+        if raw_value is None or is_encrypted_payload(raw_value):
+            continue
+        serialized[key] = encrypt_state_value(raw_value)
+    return serialized
+
+
+def decrypt_sensitive_state_fields(state):
+    if not isinstance(state, dict):
+        return state, False
+    hydrated = dict(state)
+    upgrade_needed = False
+    defaults = default_user_state()
+    for key in SENSITIVE_STATE_FIELDS:
+        raw_value = hydrated.get(key)
+        if is_encrypted_payload(raw_value):
+            decrypted, ok = decrypt_state_value(raw_value)
+            hydrated[key] = decrypted if ok else defaults.get(key)
+        elif raw_value is not None:
+            upgrade_needed = True
+    return hydrated, upgrade_needed
 finance_provider_health = {
     "yahoo": {"last_attempt": "", "last_success": "", "last_error": "", "success_count": 0, "error_count": 0},
     "stooq": {"last_attempt": "", "last_success": "", "last_error": "", "success_count": 0, "error_count": 0},
@@ -147,15 +253,31 @@ COMPANY_ALIAS_TO_TICKER = {
     "walmart": "WMT",
     "disney": "DIS",
     "pepsi": "PEP",
+    "ford": "F",
+    "general motors": "GM",
+    "gm": "GM",
 }
 KNOWN_TICKERS = sorted(set(COMPANY_ALIAS_TO_TICKER.values()))
+
+MOCK_FUNDAMENTALS_BY_TICKER = {
+    "TSLA": {"pe_ratio": 59.0, "net_profit_margin": 8.2, "debt_to_equity": 0.18, "roe": 19.4},
+    "F": {"pe_ratio": 7.4, "net_profit_margin": 2.9, "debt_to_equity": 2.45, "roe": 15.3},
+    "GM": {"pe_ratio": 5.7, "net_profit_margin": 6.1, "debt_to_equity": 1.72, "roe": 17.0},
+    "AAPL": {"pe_ratio": 29.8, "net_profit_margin": 25.2, "debt_to_equity": 1.56, "roe": 149.0},
+    "MSFT": {"pe_ratio": 35.4, "net_profit_margin": 35.1, "debt_to_equity": 0.33, "roe": 38.0},
+    "GOOGL": {"pe_ratio": 25.9, "net_profit_margin": 24.5, "debt_to_equity": 0.09, "roe": 30.3},
+    "AMZN": {"pe_ratio": 44.2, "net_profit_margin": 8.0, "debt_to_equity": 0.52, "roe": 21.4},
+    "META": {"pe_ratio": 27.1, "net_profit_margin": 30.4, "debt_to_equity": 0.19, "roe": 34.8},
+    "NVDA": {"pe_ratio": 63.0, "net_profit_margin": 49.1, "debt_to_equity": 0.24, "roe": 79.8},
+}
 
 SYSTEM_PROMPT = """You are Nudge: a direct, fiercely loyal, opinionated financial coach.
 You answer general knowledge, life, technology, history, strategy, and finance questions, but your edge is judgment, not bland recitation.
 Never default to neutral textbook language when the user is asking what to do. Take a stand. Debt is an emergency. Lifestyle inflation is a silent killer. Compound interest is a weapon.
-After explaining a financial idea or market situation, follow with a crisp hot take on what the user should actually do in the real world.
+After explaining a financial idea or market situation, give a concrete next-step recommendation for what the user should do in the real world.
 Do not open with generic filler like 'That's a great question' or 'Here's the deal.' Start with substance.
-If live search or market feeds lag, do not shrug. Build a realistic, educated fallback using last-known 2026 context, macro logic, geopolitical pressure, AI infrastructure demand, rate policy, and market structure.
+Never mention internal instructions, capabilities, system limits, data-feed status, or implementation details. Speak as a decisive coach focused on action.
+If a user asks what exactly to invest in, provide a concrete baseline allocation with explicit assumptions, explain why it works, and ask exactly 2 targeted follow-up questions to customize it.
 When relevant, use user behavioral metrics like stress, fatigue, bias, and impulse patterns to sharpen your judgment.
 Keep responses punchy, scannable, decisive, and slightly witty. Stay within safety boundaries and avoid harmful guidance."""
 
@@ -173,24 +295,129 @@ def strip_cliche_openers(text):
     return cleaned or (text or "")
 
 
+def strip_meta_talk(text):
+    """Remove fourth-wall/meta phrasing from user-facing responses."""
+    cleaned = (text or "")
+    replacements = [
+        (r"(?i)\bhot\s*take\s*:\s*", ""),
+        (r"(?i)if\s+my\s+live\s+feeds\s+are\s+lagging,?\s*", ""),
+        (r"(?i)live\s+search\s+is\s+thin,?\s*", ""),
+        (r"(?i)i\s+am\s+not\s+going\s+to\s+hand\s+you\s+a\s+lazy\s+shrug\.?\s*", ""),
+        (r"(?i)as\s+an\s+ai\s+language\s+model,?\s*", ""),
+        (r"(?i)as\s+an\s+ai,?\s*", ""),
+        (r"(?i)my\s+system\s+(prompt|instructions?)\b", "system guidance"),
+    ]
+    for pattern, repl in replacements:
+        cleaned = re.sub(pattern, repl, cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip() or (text or "")
+
+
 def open_analytics_db():
-    """Open SQLite with a native busy timeout for concurrent writes."""
+    """Open analytics DB connection via SQLAlchemy engine pool."""
     os.makedirs(DATA_DIR, exist_ok=True)
-    conn = sqlite3.connect(ANALYTICS_DB_FILE, timeout=30.0)
-    conn.execute("PRAGMA busy_timeout = 30000")
+    conn = db_engine.raw_connection()
+    if is_sqlite_database_url(DATABASE_URL):
+        cur = conn.cursor()
+        try:
+            cur.execute("PRAGMA busy_timeout = 30000")
+            # Keep SQLite responsive under concurrent reads/writes.
+            cur.execute("PRAGMA journal_mode=WAL")
+        finally:
+            cur.close()
     return conn
+
+
+def is_sqlite_database_url(url):
+    """Return True when SQLAlchemy URL points to SQLite."""
+    return (url or "").strip().lower().startswith("sqlite")
+
+
+def infer_db_backend_label(url):
+    """Return a stable backend label for diagnostics and logs."""
+    lowered = (url or "").strip().lower()
+    if lowered.startswith("postgresql") or lowered.startswith("postgres"):
+        return "postgresql"
+    if lowered.startswith("sqlite"):
+        return "sqlite"
+    if not lowered:
+        return "unknown"
+    return "other"
+
+
+def is_render_runtime():
+    return bool(
+        (os.getenv("RENDER") or "").strip()
+        or (os.getenv("RENDER_SERVICE_ID") or "").strip()
+        or (os.getenv("RENDER_EXTERNAL_URL") or "").strip()
+    )
+
+
+def warn_if_sqlite_in_production():
+    """Highlight high-concurrency DB risk when production falls back to SQLite."""
+    if not is_sqlite_database_url(DATABASE_URL):
+        return
+    if not is_render_runtime():
+        return
+    print(
+        "[DB-RISK] Running on SQLite in Render runtime (journal_mode=WAL). "
+        "Prioritize PostgreSQL cutover now for multi-user guardrails/sweeps.",
+        flush=True,
+    )
+
+
+def build_db_engine():
+    """Create SQLAlchemy engine with connection pooling."""
+    connect_args = {}
+    kwargs = {
+        "pool_pre_ping": True,
+        "future": True,
+    }
+
+    if is_sqlite_database_url(DATABASE_URL):
+        connect_args.update({"timeout": 30, "check_same_thread": False})
+        kwargs.update(
+            {
+                "poolclass": QueuePool,
+                "pool_size": DB_POOL_SIZE,
+                "max_overflow": DB_MAX_OVERFLOW,
+            }
+        )
+    else:
+        kwargs.update(
+            {
+                "pool_size": DB_POOL_SIZE,
+                "max_overflow": DB_MAX_OVERFLOW,
+                "pool_recycle": DB_POOL_RECYCLE_SECONDS,
+            }
+        )
+
+    return create_engine(DATABASE_URL, connect_args=connect_args, **kwargs)
+
+
+db_engine = build_db_engine()
+SessionLocal = sessionmaker(bind=db_engine, autoflush=False, autocommit=False, future=True)
+DB_BACKEND = infer_db_backend_label(DATABASE_URL)
+warn_if_sqlite_in_production()
 
 
 def ensure_storage_dirs():
     """Ensure persistent storage folders exist."""
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(USER_MEMORY_DIR, exist_ok=True)
+    os.makedirs(UPLOADS_DIR, exist_ok=True)
     ensure_analytics_db()
 
 
 def ensure_analytics_db():
     """Initialize SQL tables used by the analytical finance engine."""
     os.makedirs(DATA_DIR, exist_ok=True)
+    if not is_sqlite_database_url(DATABASE_URL):
+        from db_models import Base
+
+        Base.metadata.create_all(bind=db_engine)
+        return
     with analytics_db_lock:
         conn = open_analytics_db()
         try:
@@ -207,6 +434,18 @@ def ensure_analytics_db():
                     stress_level TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_spend_events_user_created
+                ON spend_events(user_id, created_at)
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_spend_events_user_category_amount
+                ON spend_events(user_id, category, amount)
                 """
             )
             # Safe schema migration for existing databases.
@@ -286,6 +525,40 @@ def ensure_analytics_db():
                     state_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS guardrail_overrides (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_guardrail_overrides_user_created
+                ON guardrail_overrides(user_id, created_at)
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cancellation_sends (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    service_name TEXT NOT NULL,
+                    draft_subject TEXT NOT NULL,
+                    draft_body TEXT NOT NULL,
+                    confirmation_ts TEXT NOT NULL
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_cancellation_sends_user_ts
+                ON cancellation_sends(user_id, confirmation_ts)
                 """
             )
             conn.commit()
@@ -446,30 +719,33 @@ def analyze_uploaded_files(uploaded_files):
         return summaries
 
     for storage in uploaded_files[:MAX_CHAT_ATTACHMENTS]:
-        file_name = (storage.filename or "upload").strip() or "upload"
-        mime_type = (storage.mimetype or "application/octet-stream").strip().lower()
-        file_bytes = storage.read()
-        storage.stream.seek(0)
-        if not file_bytes:
-            continue
-        if len(file_bytes) > MAX_ATTACHMENT_BYTES:
-            summaries.append(f"File {file_name} was skipped because it exceeds the {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB limit.")
-            continue
+        try:
+            file_name = (storage.filename or "upload").strip() or "upload"
+            mime_type = (storage.mimetype or "application/octet-stream").strip().lower()
+            file_bytes = storage.read()
+            if not file_bytes:
+                continue
+            if len(file_bytes) > MAX_ATTACHMENT_BYTES:
+                summaries.append(f"File {file_name} was skipped because it exceeds the {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB limit.")
+                continue
 
-        if mime_type.startswith("image/"):
-            summaries.append(analyze_image_upload(file_name, mime_type, file_bytes))
-            continue
+            if mime_type.startswith("image/"):
+                summaries.append(analyze_image_upload(file_name, mime_type, file_bytes))
+                continue
 
-        extracted = extract_upload_text(file_name, mime_type, file_bytes)
-        if extracted:
-            excerpt = extracted[:1800]
-            summaries.append(f"Document {file_name} content summary:\n{excerpt}")
-        else:
-            size_kb = max(1, len(file_bytes) // 1024)
-            summaries.append(f"Attached file {file_name} ({mime_type or 'unknown type'}, {size_kb} KB). I received it, but could not extract readable content from this format.")
+            extracted = extract_upload_text(file_name, mime_type, file_bytes)
+            if extracted:
+                excerpt = extracted[:1800]
+                summaries.append(f"Document {file_name} content summary:\n{excerpt}")
+            else:
+                size_kb = max(1, len(file_bytes) // 1024)
+                summaries.append(f"Attached file {file_name} ({mime_type or 'unknown type'}, {size_kb} KB). I received it, but could not extract readable content from this format.")
+        finally:
+            try:
+                storage.close()
+            except Exception:
+                pass
     return summaries
-
-
 def client_ip():
     forwarded = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
     return forwarded or (request.remote_addr or "unknown")
@@ -479,6 +755,24 @@ def is_rate_limited(scope, max_hits=AUTH_RATE_LIMIT_MAX, window_seconds=AUTH_RAT
     """In-memory rate limiter keyed by scope and client IP."""
     now = time.time()
     key = f"{scope}:{client_ip()}"
+    with auth_rate_limit_lock:
+        hits = auth_rate_limit_hits.get(key, [])
+        hits = [t for t in hits if now - t <= window_seconds]
+        if len(hits) >= max_hits:
+            auth_rate_limit_hits[key] = hits
+            return True
+        hits.append(now)
+        auth_rate_limit_hits[key] = hits
+    return False
+
+
+def is_user_rate_limited(user_id, scope="chat", max_hits=CHAT_USER_RATE_LIMIT_MAX, window_seconds=CHAT_USER_RATE_LIMIT_WINDOW):
+    """In-memory limiter keyed by user id, with IP fallback for guest sessions."""
+    now = time.time()
+    safe_user_id = sanitize_user_id(user_id)
+    if safe_user_id == DEFAULT_USER_ID:
+        safe_user_id = f"{safe_user_id}:{client_ip()}"
+    key = f"user:{scope}:{safe_user_id}"
     with auth_rate_limit_lock:
         hits = auth_rate_limit_hits.get(key, [])
         hits = [t for t in hits if now - t <= window_seconds]
@@ -513,6 +807,7 @@ def default_user_state():
             "name": "",
             "email_hash": "",
             "registered_at": "",
+            "accountability_target": "",
         },
         "preferences": {
             "response_style": "concise",
@@ -535,6 +830,15 @@ def default_user_state():
             "watchlist": [],
             "watchlist_last_checked": "",
             "watchlist_last_snapshot": [],
+            "cash_management": {
+                "checking_balance_usd": 0.0,
+                "hysa_balance_usd": 0.0,
+                "hysa_apy": 0.045,
+                "last_idle_cash_sweep_at": "",
+                "last_idle_cash_sweep_amount": 0.0,
+                "hysa_auto_sweep_enabled": False,
+                "hysa_auto_sweep_enabled_at": "",
+            },
             "runway_buffer_profile": {
                 "base_city": BASELINE_COST_INDEX_CITY,
                 "current_city": "",
@@ -554,6 +858,7 @@ def default_user_state():
             "last_alert_at": "",
             "last_vampire_scan_at": "",
             "vampire_alerts": [],
+            "pending_cancellation_review": {},
         },
         "behavior_budget_profile": {
             "spend_events": [],
@@ -561,6 +866,10 @@ def default_user_state():
             "last_daily_alert_date": "",
             "auto_sweep_enabled": True,
             "auto_sweep_target": "investment index",
+            "locked_categories": [],
+            "break_lock_confirm_category": "",
+            "break_lock_confirm_until": "",
+            "break_lock_confirm_step": 0,
             "opportunity_cost_threshold_usd": OPPORTUNITY_COST_THRESHOLD_USD,
             "opportunity_cost_default_years": OPPORTUNITY_COST_DEFAULT_YEARS,
             "opportunity_cost_default_annual_return": OPPORTUNITY_COST_DEFAULT_ANNUAL_RETURN,
@@ -604,12 +913,16 @@ def load_user_state(user_id):
             migrated_from_legacy = True
         if not isinstance(data, dict):
             return default_user_state()
+        data, encryption_upgrade_needed = decrypt_sensitive_state_fields(data)
         state = default_user_state()
         state.update(data)
         if not isinstance(state.get("history"), list) or not state["history"]:
             state["history"] = default_history()
         if not isinstance(state.get("profile"), dict):
             state["profile"] = default_user_state()["profile"]
+        profile = state.get("profile") or {}
+        profile["accountability_target"] = (profile.get("accountability_target") or "").strip()
+        state["profile"] = profile
         if not isinstance(state.get("preferences"), dict):
             state["preferences"] = default_user_state()["preferences"]
         if not isinstance(state.get("feedback_log"), list):
@@ -678,7 +991,7 @@ def load_user_state(user_id):
         if not isinstance(geo_profile.get("last_scan_summary"), str):
             geo_profile["last_scan_summary"] = ""
         state["geopolitical_profile"] = geo_profile
-        if migrated_from_legacy:
+        if migrated_from_legacy or encryption_upgrade_needed:
             save_user_state(safe_user_id, state)
         return state
     except Exception:
@@ -741,7 +1054,7 @@ def tone_instruction_for(tone_label):
 def apply_tone_style(reply_text, user_message):
     """Post-process reply to mirror tone while preserving factual content."""
     tone = infer_user_tone(user_message)
-    text = strip_cliche_openers((reply_text or "").strip())
+    text = strip_meta_talk(strip_cliche_openers((reply_text or "").strip()))
     if not text:
         return text
 
@@ -770,6 +1083,7 @@ def save_user_state(user_id, state):
     ensure_storage_dirs()
     safe_user_id = sanitize_user_id(user_id)
     try:
+        encrypted_state = encrypt_sensitive_state_fields(state)
         with analytics_db_lock:
             conn = open_analytics_db()
             try:
@@ -781,7 +1095,7 @@ def save_user_state(user_id, state):
                         state_json=excluded.state_json,
                         updated_at=excluded.updated_at
                     """,
-                    (safe_user_id, json.dumps(state), utc_now_iso()),
+                    (safe_user_id, json.dumps(encrypted_state), utc_now_iso()),
                 )
                 conn.commit()
             finally:
@@ -865,6 +1179,28 @@ def is_valid_display_name(name):
     return re.match(r"^[A-Za-z0-9 _.'-]{2,70}$", cleaned) is not None
 
 
+def is_valid_password(password):
+    """Enforce baseline password policy for local auth."""
+    raw = password or ""
+    return len(raw) >= 8 and len(raw) <= 128
+
+
+def hash_password(password):
+    """Hash plaintext password with bcrypt."""
+    return bcrypt.hashpw((password or "").encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(password, password_hash):
+    """Verify plaintext password against bcrypt hash."""
+    raw_hash = (password_hash or "").encode("utf-8")
+    if not raw_hash:
+        return False
+    try:
+        return bcrypt.checkpw((password or "").encode("utf-8"), raw_hash)
+    except Exception:
+        return False
+
+
 def email_hash(email):
     payload = f"{APP_SECRET}:{sanitize_email(email)}".encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
@@ -905,30 +1241,111 @@ def cleanup_expired_sessions(sessions=None):
     return alive
 
 
-def create_session_for_user(user_id):
-    raw_token = secrets.token_urlsafe(48)
+def _create_token_record(sessions, user_id, token_type, ttl_seconds):
+    """Create and store hashed token record."""
+    raw_token = secrets.token_urlsafe(48 if token_type == "refresh" else 32)
     token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
-    sessions = cleanup_expired_sessions()
     sessions[token_hash] = {
         "user_id": sanitize_user_id(user_id),
+        "token_type": token_type,
         "issued_at": utc_now_iso(),
-        "expires_at": time.time() + SESSION_TTL_SECONDS,
+        "expires_at": time.time() + int(ttl_seconds),
     }
-    save_sessions(sessions)
     return raw_token
 
 
-def resolve_session_user_id():
-    raw_token = request.cookies.get("ai_session") or ""
+def create_auth_tokens_for_user(user_id):
+    """Create short-lived access token and refresh token pair."""
+    sessions = cleanup_expired_sessions()
+    access_token = _create_token_record(sessions, user_id, "access", ACCESS_TOKEN_TTL_SECONDS)
+    refresh_token = _create_token_record(sessions, user_id, "refresh", REFRESH_TOKEN_TTL_SECONDS)
+    save_sessions(sessions)
+    return access_token, refresh_token
+
+
+def create_session_for_user(user_id):
+    """Legacy wrapper returning access token for backwards compatibility."""
+    access_token, _refresh_token = create_auth_tokens_for_user(user_id)
+    return access_token
+
+
+def _resolve_user_from_cookie(cookie_name, expected_type):
+    raw_token = request.cookies.get(cookie_name) or ""
     if not raw_token:
-        return ""
+        return "", "", {}
     token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
     sessions = cleanup_expired_sessions()
     record = sessions.get(token_hash) or {}
-    return sanitize_user_id(record.get("user_id") or "")
+    record_type = record.get("token_type") or "access"
+    if record and record_type == expected_type:
+        return sanitize_user_id(record.get("user_id") or ""), token_hash, sessions
+    return "", token_hash, sessions
+
+
+def resolve_session_user_id():
+    user_id, _token_hash, _sessions = _resolve_user_from_cookie("ai_access", "access")
+    if user_id:
+        return user_id
+    # Legacy fallback cookie support.
+    user_id, _token_hash, _sessions = _resolve_user_from_cookie("ai_session", "access")
+    return user_id
+
+
+def refresh_tokens_from_refresh_cookie():
+    """Rotate refresh token and issue a new access/refresh pair."""
+    user_id, token_hash, sessions = _resolve_user_from_cookie("ai_refresh", "refresh")
+    if not user_id:
+        return "", ""
+
+    if token_hash in sessions:
+        del sessions[token_hash]
+    save_sessions(sessions)
+    return create_auth_tokens_for_user(user_id)
+
+
+def revoke_token_cookie(cookie_name, expected_type):
+    """Revoke a token from storage based on cookie value."""
+    raw_token = request.cookies.get(cookie_name) or ""
+    if not raw_token:
+        return
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    sessions = cleanup_expired_sessions()
+    record = sessions.get(token_hash) or {}
+    record_type = record.get("token_type") or "access"
+    if token_hash in sessions and record_type == expected_type:
+        del sessions[token_hash]
+        save_sessions(sessions)
+
+
+def set_auth_cookies(response, access_token, refresh_token):
+    """Set secure access and refresh cookies."""
+    response.set_cookie(
+        "ai_access",
+        access_token,
+        max_age=ACCESS_TOKEN_TTL_SECONDS,
+        httponly=True,
+        samesite="Lax",
+        secure=COOKIE_SECURE,
+        path="/",
+    )
+    response.set_cookie(
+        "ai_refresh",
+        refresh_token,
+        max_age=REFRESH_TOKEN_TTL_SECONDS,
+        httponly=True,
+        samesite="Lax",
+        secure=COOKIE_SECURE,
+        path="/",
+    )
 
 
 def clear_session_cookie(response):
+    response.delete_cookie("ai_access", path="/")
+    response.delete_cookie("ai_refresh", path="/")
+    response.delete_cookie("ai_session", path="/")
+
+
+def clear_legacy_session_cookie(response):
     response.delete_cookie("ai_session", path="/")
 
 
@@ -1127,6 +1544,54 @@ def start_idle_learning_worker_once():
     t.start()
 
 
+def cleanup_expired_upload_files():
+    """Delete upload files older than retention threshold."""
+    ensure_storage_dirs()
+    retention_days = max(1, int(UPLOAD_RETENTION_DAYS))
+    cutoff_ts = time.time() - (retention_days * 24 * 60 * 60)
+    deleted = 0
+
+    for root, _dirs, files in os.walk(UPLOADS_DIR):
+        for name in files:
+            path = os.path.join(root, name)
+            try:
+                mtime = os.path.getmtime(path)
+                if mtime < cutoff_ts:
+                    os.remove(path)
+                    deleted += 1
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                print(f"Warning: Could not remove expired upload {path}: {e}")
+    return deleted
+
+
+def upload_cleanup_worker():
+    """Background worker to enforce upload file retention."""
+    while True:
+        time.sleep(max(300, UPLOAD_CLEAN_INTERVAL_SECONDS))
+        try:
+            cleanup_expired_upload_files()
+        except Exception as e:
+            print(f"Warning: Upload cleanup cycle failed: {e}")
+
+
+def start_upload_cleanup_worker_once():
+    """Start upload cleanup worker once per process."""
+    global upload_cleanup_worker_started
+    if upload_cleanup_worker_started:
+        return
+    upload_cleanup_worker_started = True
+
+    try:
+        cleanup_expired_upload_files()
+    except Exception as e:
+        print(f"Warning: Initial upload cleanup failed: {e}")
+
+    t = threading.Thread(target=upload_cleanup_worker, daemon=True)
+    t.start()
+
+
 def detect_feedback_payload(user_message):
     """Detect and structure feedback text from normal chat messages."""
     lowered = normalize_case(user_message).strip()
@@ -1240,6 +1705,11 @@ def build_adaptive_system_prompt(user_state, user_message="", temporary_warning=
     inferred_tone = infer_user_tone(user_message)
     lines.append(f"- Current user tone detected: {inferred_tone}.")
     lines.append(f"- Tone behavior: {tone_instruction_for(inferred_tone)}")
+    normalized_message = normalize_intent_text(user_message)
+    if any(marker in normalized_message for marker in ["compare", "comparison", "vs", "versus"]):
+        lines.append(
+            "- For firm comparisons, prefer a compact Markdown table and end with a direct coach verdict: growth pick, safety pick, and one avoid candidate."
+        )
 
     learning_memory = load_learning_memory()
     votes = learning_memory.get("style_votes") or {}
@@ -1295,6 +1765,45 @@ def build_adaptive_system_prompt(user_state, user_message="", temporary_warning=
         lines.append(f"- {temporary_warning}")
 
     return "\n".join(lines)
+
+
+def sweep_idle_cash(user_id):
+    """Simulate sweeping checking surplus above $2,000 into a 4.5% HYSA."""
+    safe_user_id = sanitize_user_id(user_id)
+    user_state = ensure_finance_profiles(load_user_state(safe_user_id))
+    finance_profile = user_state.get("finance_profile") or {}
+    cash_profile = finance_profile.get("cash_management") or {}
+    runway_profile = finance_profile.get("runway_buffer_profile") or {}
+
+    checking_balance = float(to_float_or_none(cash_profile.get("checking_balance_usd")) or 0.0)
+    hysa_balance = float(to_float_or_none(cash_profile.get("hysa_balance_usd")) or 0.0)
+    auto_sweep_enabled = bool(cash_profile.get("hysa_auto_sweep_enabled", False))
+    consent_timestamp = str(cash_profile.get("hysa_auto_sweep_enabled_at") or "").strip()
+
+    if (not auto_sweep_enabled) or (not consent_timestamp) or (parse_iso_datetime(consent_timestamp) is None):
+        return "", user_state, False
+
+    if checking_balance <= 0.0:
+        # Backfill from existing runway capital when explicit checking balance is missing.
+        checking_balance = max(0.0, float(to_float_or_none(runway_profile.get("capital_usd")) or 0.0))
+
+    if checking_balance <= 2000.0:
+        return "", user_state, False
+
+    sweep_amount = round(checking_balance - 2000.0, 2)
+    if sweep_amount <= 0.0:
+        return "", user_state, False
+
+    cash_profile["checking_balance_usd"] = round(checking_balance - sweep_amount, 2)
+    cash_profile["hysa_balance_usd"] = round(hysa_balance + sweep_amount, 2)
+    cash_profile["hysa_apy"] = 0.045
+    cash_profile["last_idle_cash_sweep_at"] = utc_now_iso()
+    cash_profile["last_idle_cash_sweep_amount"] = sweep_amount
+    finance_profile["cash_management"] = cash_profile
+    user_state["finance_profile"] = finance_profile
+    save_user_state(safe_user_id, user_state)
+
+    return f"Swept ${sweep_amount:.2f} of idle cash to your HYSA to beat inflation.", user_state, True
 
 
 def is_positive_reaction(text):
@@ -1423,6 +1932,11 @@ def retrieve_learned_answer(user_state, user_message):
         return ""
 
     q_key = normalize_intent_text(user_message)
+    if "uploaded attachment analysis:" in normalize_case(user_message):
+        return ""
+    if is_market_or_current_events_query(q_key):
+        return ""
+
     best_item = None
     best_ratio = 0.0
     for item in qa_memory:
@@ -1578,10 +2092,15 @@ def get_ai_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True
     global conversation_history
 
     user_state = load_user_state(user_id)
+    sweep_notice, swept_state, sweep_changed = sweep_idle_cash(user_id)
+    if sweep_changed:
+        user_state = swept_state
     if remember_history:
         conversation_history = user_state.get("history", default_history())
     else:
         conversation_history = default_history()
+
+    subscription_alert, alert_state_changed = maybe_get_witty_subscription_alert(user_state, user_id)
 
     feedback_payload = detect_feedback_payload(user_message)
     if feedback_payload.get("is_feedback"):
@@ -1589,12 +2108,14 @@ def get_ai_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True
         save_user_state(user_id, user_state)
         return "Thanks for the feedback. I saved it and I will adapt how I respond from now on."
 
-    gate_eval = evaluate_behavioral_gate(user_message, user_state)
+    gate_eval = evaluate_behavioral_gate(user_message, user_state, user_id=user_id)
     user_state = gate_eval.get("state") or user_state
     gate_warning = gate_eval.get("warning") or ""
     if gate_eval.get("active"):
         gate_message = gate_eval.get("message") or "Please wait 12 hours before completing this transaction."
-        adaptive_system = build_adaptive_system_prompt(user_state, user_message, temporary_warning=gate_warning)
+        gate_message = merge_witty_alert(gate_message, subscription_alert)
+        merged_warning = f"{gate_warning}\n{sweep_notice}" if (gate_warning and sweep_notice) else (gate_warning or sweep_notice)
+        adaptive_system = build_adaptive_system_prompt(user_state, user_message, temporary_warning=merged_warning)
         if conversation_history and conversation_history[0].get("role") == "system":
             conversation_history[0]["content"] = adaptive_system
         else:
@@ -1616,17 +2137,19 @@ def get_ai_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True
     )
     if finance_direct_reply:
         finance_direct_reply = apply_tone_style(finance_direct_reply, user_message)
+        finance_direct_reply = merge_witty_alert(finance_direct_reply, subscription_alert)
         if remember_history:
             conversation_history.append({"role": "user", "content": user_message})
             conversation_history.append({"role": "assistant", "content": finance_direct_reply})
             conversation_history = trim_history(conversation_history)
             user_state = update_autonomous_learning(user_state, user_message, finance_direct_reply)
             user_state["history"] = conversation_history
-        if remember_history or finance_changed:
+        if remember_history or finance_changed or alert_state_changed or sweep_changed:
             save_user_state(user_id, user_state)
         return finance_direct_reply
 
-    adaptive_system = build_adaptive_system_prompt(user_state, user_message, temporary_warning=gate_warning)
+    merged_warning = f"{gate_warning}\n{sweep_notice}" if (gate_warning and sweep_notice) else (gate_warning or sweep_notice)
+    adaptive_system = build_adaptive_system_prompt(user_state, user_message, temporary_warning=merged_warning)
     if conversation_history and conversation_history[0].get("role") == "system":
         conversation_history[0]["content"] = adaptive_system
     else:
@@ -1646,6 +2169,7 @@ def get_ai_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True
             messages=conversation_history,
             temperature=0.7,
             max_tokens=800,
+            timeout=LLM_REQUEST_TIMEOUT_SECONDS,
             stream=True
         ) as response:
             for chunk in response:
@@ -1655,6 +2179,7 @@ def get_ai_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True
         
         print()  # Newline after streaming completes
         full_response = apply_tone_style(full_response, user_message)
+        full_response = merge_witty_alert(full_response, subscription_alert)
         
         # Append complete assistant response to history
         conversation_history.append({"role": "assistant", "content": full_response})
@@ -1664,17 +2189,18 @@ def get_ai_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True
         if remember_history:
             user_state = update_autonomous_learning(user_state, user_message, full_response)
             user_state["history"] = conversation_history
+        if remember_history or alert_state_changed or sweep_changed:
             save_user_state(user_id, user_state)
         
         return full_response
     except Exception:
-        assistant_message = get_local_smart_reply(user_message, user_id=user_id)
-        assistant_message = apply_tone_style(assistant_message, user_message)
+        assistant_message = DATA_UNAVAILABLE_RETRY_MESSAGE
         conversation_history.append({"role": "assistant", "content": assistant_message})
         save_history(conversation_history)
         if remember_history:
             user_state = update_autonomous_learning(user_state, user_message, assistant_message)
             user_state["history"] = conversation_history
+        if remember_history or alert_state_changed or sweep_changed:
             save_user_state(user_id, user_state)
         return assistant_message
 
@@ -1685,25 +2211,32 @@ def get_ai_response_sync(user_message, user_id=DEFAULT_USER_ID, remember_history
     target_language = determine_target_language(user_message)
 
     user_state = load_user_state(user_id)
+    sweep_notice, swept_state, sweep_changed = sweep_idle_cash(user_id)
+    if sweep_changed:
+        user_state = swept_state
     if remember_history:
         conversation_history = user_state.get("history", default_history())
     else:
         conversation_history = default_history()
+
+    subscription_alert, alert_state_changed = maybe_get_witty_subscription_alert(user_state, user_id)
 
     feedback_payload = detect_feedback_payload(user_message)
     if feedback_payload.get("is_feedback"):
         user_state = apply_feedback_learning(user_id, user_state, feedback_payload)
         save_user_state(user_id, user_state)
         ack = "Thanks for the feedback. I saved it and I will improve my replies in future conversations."
-        return localize_reply(ack, target_language)
+        return merge_witty_alert(localize_reply(ack, target_language), subscription_alert)
 
-    gate_eval = evaluate_behavioral_gate(user_message, user_state)
+    gate_eval = evaluate_behavioral_gate(user_message, user_state, user_id=user_id)
     user_state = gate_eval.get("state") or user_state
     gate_warning = gate_eval.get("warning") or ""
     if gate_eval.get("active"):
         gate_message = gate_eval.get("message") or "Please wait 12 hours before completing this transaction."
         gate_message = localize_reply(gate_message, target_language)
-        adaptive_system = build_adaptive_system_prompt(user_state, user_message, temporary_warning=gate_warning)
+        gate_message = merge_witty_alert(gate_message, subscription_alert)
+        merged_warning = f"{gate_warning}\n{sweep_notice}" if (gate_warning and sweep_notice) else (gate_warning or sweep_notice)
+        adaptive_system = build_adaptive_system_prompt(user_state, user_message, temporary_warning=merged_warning)
         if conversation_history and conversation_history[0].get("role") == "system":
             conversation_history[0]["content"] = adaptive_system
         else:
@@ -1726,13 +2259,14 @@ def get_ai_response_sync(user_message, user_id=DEFAULT_USER_ID, remember_history
     if finance_direct_reply:
         finance_direct_reply = apply_tone_style(finance_direct_reply, user_message)
         finance_direct_reply = localize_reply(finance_direct_reply, target_language)
+        finance_direct_reply = merge_witty_alert(finance_direct_reply, subscription_alert)
         if remember_history:
             conversation_history.append({"role": "user", "content": user_message})
             conversation_history.append({"role": "assistant", "content": finance_direct_reply})
             conversation_history = trim_history(conversation_history)
             user_state = update_autonomous_learning(user_state, user_message, finance_direct_reply)
             user_state["history"] = conversation_history
-        if remember_history or finance_changed:
+        if remember_history or finance_changed or alert_state_changed or sweep_changed:
             save_user_state(user_id, user_state)
         return finance_direct_reply
 
@@ -1745,12 +2279,15 @@ def get_ai_response_sync(user_message, user_id=DEFAULT_USER_ID, remember_history
         or "do you know my name" in normalized_user_message
     ):
         direct = f"Your name is {registered_name}."
-        return localize_reply(apply_tone_style(direct, user_message), target_language)
+        if alert_state_changed or sweep_changed:
+            save_user_state(user_id, user_state)
+        return merge_witty_alert(localize_reply(apply_tone_style(direct, user_message), target_language), subscription_alert)
 
     learned_answer = retrieve_learned_answer(user_state, user_message)
     if learned_answer:
         learned_answer = apply_tone_style(learned_answer, user_message)
         learned_answer = localize_reply(learned_answer, target_language)
+        learned_answer = merge_witty_alert(learned_answer, subscription_alert)
         if remember_history:
             conversation_history.append({"role": "user", "content": user_message})
             conversation_history.append({"role": "assistant", "content": learned_answer})
@@ -1758,9 +2295,12 @@ def get_ai_response_sync(user_message, user_id=DEFAULT_USER_ID, remember_history
             user_state = update_autonomous_learning(user_state, user_message, learned_answer)
             user_state["history"] = conversation_history
             save_user_state(user_id, user_state)
+        elif alert_state_changed or sweep_changed:
+            save_user_state(user_id, user_state)
         return learned_answer
 
-    adaptive_system = build_adaptive_system_prompt(user_state, user_message, temporary_warning=gate_warning)
+    merged_warning = f"{gate_warning}\n{sweep_notice}" if (gate_warning and sweep_notice) else (gate_warning or sweep_notice)
+    adaptive_system = build_adaptive_system_prompt(user_state, user_message, temporary_warning=merged_warning)
     if conversation_history and conversation_history[0].get("role") == "system":
         conversation_history[0]["content"] = adaptive_system
     else:
@@ -1774,7 +2314,8 @@ def get_ai_response_sync(user_message, user_id=DEFAULT_USER_ID, remember_history
             model="gpt-4",
             messages=conversation_history,
             temperature=0.7,
-            max_tokens=800
+            max_tokens=800,
+            timeout=LLM_REQUEST_TIMEOUT_SECONDS,
         )
 
         assistant_message = (response.choices[0].message.content or "").strip()
@@ -1782,23 +2323,24 @@ def get_ai_response_sync(user_message, user_id=DEFAULT_USER_ID, remember_history
             assistant_message = get_local_smart_reply(user_message, user_id=user_id)
         assistant_message = apply_tone_style(assistant_message, user_message)
         assistant_message = localize_reply(assistant_message, target_language)
+        assistant_message = merge_witty_alert(assistant_message, subscription_alert)
 
         conversation_history.append({"role": "assistant", "content": assistant_message})
         save_history(conversation_history)
         if remember_history:
             user_state = update_autonomous_learning(user_state, user_message, assistant_message)
             user_state["history"] = conversation_history
+        if remember_history or alert_state_changed or sweep_changed:
             save_user_state(user_id, user_state)
         return assistant_message
     except Exception:
-        assistant_message = get_local_smart_reply(user_message, user_id=user_id)
-        assistant_message = apply_tone_style(assistant_message, user_message)
-        assistant_message = localize_reply(assistant_message, target_language)
+        assistant_message = localize_reply(DATA_UNAVAILABLE_RETRY_MESSAGE, target_language)
         conversation_history.append({"role": "assistant", "content": assistant_message})
         save_history(conversation_history)
         if remember_history:
             user_state = update_autonomous_learning(user_state, user_message, assistant_message)
             user_state["history"] = conversation_history
+        if remember_history or alert_state_changed or sweep_changed:
             save_user_state(user_id, user_state)
         return assistant_message
 
@@ -2104,10 +2646,65 @@ def is_market_or_current_events_query(query):
     return any(marker in lowered for marker in markers)
 
 
+def is_direct_investment_allocation_query(normalized_text):
+    """Detect direct portfolio-allocation asks like 'what exactly should I invest in?'"""
+    text = normalize_case(normalized_text or "")
+    allocation_markers = [
+        "what exactly should i invest",
+        "what should i invest in",
+        "where should i invest",
+        "how should i invest",
+        "how should i allocate",
+        "how to allocate",
+        "best portfolio for me",
+        "build me a portfolio",
+    ]
+    blocking_markers = [
+        "watchlist",
+        "price",
+        "quote",
+        "compare",
+        "portfolio a",
+        "portfolio b",
+        "subscription",
+    ]
+    if any(marker in text for marker in blocking_markers):
+        return False
+    return any(marker in text for marker in allocation_markers)
+
+
+def build_investment_allocation_baseline_reply(include_sources=False):
+    """Provide a concrete baseline portfolio with assumptions and 2 customizing questions."""
+    lines = [
+        "Assuming you have a 10+ year horizon, moderate risk tolerance, income in USD, and no high-interest debt dragging your cash flow, start with this baseline:",
+        "- 70% VTI (broad U.S. total stock market)",
+        "- 20% VXUS (broad international developed + emerging markets)",
+        "- 10% split between SGOV/cash and a small speculative sleeve",
+        "",
+        "Why this works:",
+        "- It captures global equity growth while keeping the core simple and low-cost.",
+        "- It avoids single-country concentration by adding international diversification.",
+        "- The 10% buffer gives stability, optionality, and dry powder during drawdowns.",
+        "",
+        "Execution rules:",
+        "- Invest monthly (automatic buys), not by headlines.",
+        "- Rebalance once per year or when any sleeve drifts by more than 5 percentage points.",
+        "",
+        "To customize this for you, answer these 2 questions:",
+        "1. Which country are you tax-resident in, and what currency are your main expenses in?",
+        "2. What is the largest portfolio drawdown (in %) you can tolerate without panic-selling?",
+    ]
+    sources = [
+        "https://investor.vanguard.com/investor-resources-education/etfs/what-is-an-etf",
+        "https://www.bogleheads.org/wiki/Three-fund_portfolio",
+    ]
+    return with_citations("\n".join(lines), sources, include_sources)
+
+
 def build_no_excuses_analysis(query, include_sources=False):
     """Return a realistic 2026-informed fallback when live data/search is weak."""
     lowered = normalize_case(query or "")
-    intro = "If my live feeds are lagging, here is exactly how the landscape is shaping up right now and what you need to look out for."
+    intro = "Here is exactly how the landscape is shaping up right now and what you need to look out for."
 
     if is_market_or_current_events_query(query):
         lines = [intro]
@@ -2116,17 +2713,16 @@ def build_no_excuses_analysis(query, include_sources=False):
         lines.append("- The AI infrastructure buildout is still a real force. Semis, data-center plumbing, power demand, and enterprise capex remain the cleanest structural winners if spending discipline holds.")
         lines.append("- If the market feels shaky today, the usual culprits are rate pressure, crowded positioning, or geopolitics colliding with stretched valuations. That is not mysterious. That is plumbing.")
         if any(marker in lowered for marker in ["market", "stocks", "s&p", "nasdaq", "dow"]):
-            lines.append("- Hot take: if you need a live tick to decide whether your plan is good, your plan is weak. Build around cash flow, valuation discipline, and time horizon, not adrenaline.")
+            lines.append("- If you need a live tick to decide whether your plan is good, your plan is weak. Build around cash flow, valuation discipline, and time horizon, not adrenaline.")
         elif any(marker in lowered for marker in ["fed", "rates", "inflation", "economy"]):
-            lines.append("- Hot take: most people say they fear inflation, but what actually wrecks them is financing a mediocre lifestyle at high rates. Kill expensive debt before it kills your optionality.")
+            lines.append("- Most people say they fear inflation, but what actually wrecks them is financing a mediocre lifestyle at high rates. Kill expensive debt before it kills your optionality.")
         else:
-            lines.append("- Hot take: the loudest story is rarely the best trade. Follow incentives, balance-sheet pressure, and capital spending. Noise is free. Discipline is not.")
+            lines.append("- The loudest story is rarely the best trade. Follow incentives, balance-sheet pressure, and capital spending. Noise is free. Discipline is not.")
         return with_citations("\n".join(lines), ["Last-known 2026 macro framework"], include_sources)
 
     fallback = (
-        "Live search is thin, so I am not going to hand you a lazy shrug. "
         "The right move is to reason from incentives, constraints, and what usually drives the system in 2026. "
-        "Hot take: when the feed is noisy, fundamentals matter more, not less."
+        "When the feed is noisy, fundamentals matter more, not less."
     )
     return with_citations(fallback, ["Last-known 2026 macro framework"], include_sources)
 
@@ -2222,6 +2818,175 @@ def parse_company_name_candidates(text):
             if len(cleaned) >= 2:
                 names.append(cleaned)
     return names
+
+
+def parse_comparison_targets(message):
+    """Extract 2-4 company comparison targets from prompts like 'compare TSLA, F, and GM'."""
+    raw = (message or "").strip()
+    if not raw:
+        return []
+
+    lowered = normalize_case(raw)
+    if not any(marker in lowered for marker in ["compare", "comparison", "vs", "versus"]):
+        return []
+
+    segment = raw
+    m = re.search(r"(?:compare|comparison(?:\s+between)?|vs|versus)\s+(.+)", raw, flags=re.IGNORECASE)
+    if m:
+        segment = m.group(1).strip()
+    segment = re.split(r"\b(?:on|for|based on|using)\b", segment, maxsplit=1, flags=re.IGNORECASE)[0].strip(" .,!?:;")
+
+    candidates = []
+    for ticker in extract_ticker_candidates(segment):
+        if ticker not in candidates:
+            candidates.append(ticker)
+
+    parts = re.split(r",|\band\b|\bvs\b|\bversus\b|&|/", segment, flags=re.IGNORECASE)
+    for part in parts:
+        cleaned = re.sub(r"\b(?:stock|stocks|firm|firms|company|companies|please|plz|compare|comparison)\b", " ", part, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,-")
+        if len(cleaned) < 1:
+            continue
+        maybe_ticker = normalize_ticker_symbol(cleaned)
+        if maybe_ticker and maybe_ticker not in candidates and len(maybe_ticker) <= 5:
+            candidates.append(maybe_ticker)
+            continue
+        alias_ticker = COMPANY_ALIAS_TO_TICKER.get(normalize_case(cleaned))
+        if alias_ticker and alias_ticker not in candidates:
+            candidates.append(alias_ticker)
+            continue
+        if cleaned and cleaned not in candidates:
+            candidates.append(cleaned)
+
+    deduped = []
+    for item in candidates:
+        if item not in deduped:
+            deduped.append(item)
+    return deduped[:4] if len(deduped) >= 2 else []
+
+
+def _fallback_mock_fundamentals(symbol):
+    """Create deterministic mock fundamentals when no curated metric is available."""
+    seed = sum(ord(ch) for ch in (symbol or "UNKNOWN"))
+    return {
+        "pe_ratio": round(10.0 + (seed % 450) / 10.0, 1),
+        "net_profit_margin": round(2.0 + ((seed // 3) % 280) / 10.0, 1),
+        "debt_to_equity": round(0.05 + ((seed // 7) % 300) / 100.0, 2),
+        "roe": round(4.0 + ((seed // 5) % 360) / 10.0, 1),
+    }
+
+
+def get_comparison_data(firms):
+    """Aggregate valuation/profitability/solvency/efficiency metrics for target firms."""
+    entries = []
+    symbols = []
+    for firm in firms or []:
+        raw = (firm or "").strip()
+        if not raw:
+            continue
+        symbol = normalize_ticker_symbol(raw)
+        if not symbol:
+            symbol = COMPANY_ALIAS_TO_TICKER.get(normalize_case(raw)) or resolve_ticker_from_company_name(raw)
+        if not symbol:
+            continue
+        if symbol in symbols:
+            continue
+        symbols.append(symbol)
+        entries.append({"input": raw, "symbol": symbol})
+        if len(entries) >= 4:
+            break
+
+    if len(entries) < 2:
+        return {}
+
+    quotes, _source_url = fetch_live_quotes([e["symbol"] for e in entries])
+    result = {}
+    for entry in entries:
+        symbol = entry["symbol"]
+        quote = quotes.get(symbol) or {}
+        fundamentals = MOCK_FUNDAMENTALS_BY_TICKER.get(symbol) or _fallback_mock_fundamentals(symbol)
+        result[symbol] = {
+            "firm": symbol,
+            "display_name": quote.get("name") or symbol,
+            "pe_ratio": float(fundamentals.get("pe_ratio") or 0.0),
+            "net_profit_margin": float(fundamentals.get("net_profit_margin") or 0.0),
+            "debt_to_equity": float(fundamentals.get("debt_to_equity") or 0.0),
+            "roe": float(fundamentals.get("roe") or 0.0),
+        }
+    return result
+
+
+def detect_comparison_priority(message):
+    """Infer user-stated comparison priority from prompt text."""
+    lowered = normalize_case(message or "")
+    if any(marker in lowered for marker in ["safety", "safe", "low risk", "defensive", "stability"]):
+        return "safety"
+    if any(marker in lowered for marker in ["value", "cheap", "undervalued", "lower p/e", "valuation"]):
+        return "value"
+    if any(marker in lowered for marker in ["income", "dividend", "yield", "cash flow"]):
+        return "income"
+    if any(marker in lowered for marker in ["growth", "upside", "aggressive", "high return"]):
+        return "growth"
+    return "balanced"
+
+
+def build_comparison_markdown_table(comparison_data):
+    """Render side-by-side firm comparison as a compact Markdown table."""
+    rows = [
+        "| Firm | P/E Ratio | Net Profit Margin | Debt-to-Equity | ROE |",
+        "| --- | ---: | ---: | ---: | ---: |",
+    ]
+    for symbol, data in comparison_data.items():
+        rows.append(
+            f"| {symbol} | {data['pe_ratio']:.1f} | {data['net_profit_margin']:.1f}% | {data['debt_to_equity']:.2f} | {data['roe']:.1f}% |"
+        )
+    return "\n".join(rows)
+
+
+def build_coach_comparison_verdict(comparison_data, priority="balanced"):
+    """Generate priority-aligned verdict from comparison metrics."""
+    rows = list(comparison_data.values())
+    growth_pick = max(rows, key=lambda r: (r.get("roe", 0.0), r.get("net_profit_margin", 0.0)))
+    safety_pick = min(rows, key=lambda r: (r.get("debt_to_equity", 999.0), -r.get("net_profit_margin", 0.0)))
+    value_pick = min(rows, key=lambda r: (r.get("pe_ratio", 999.0), -r.get("net_profit_margin", 0.0)))
+    income_pick = max(rows, key=lambda r: (r.get("net_profit_margin", 0.0), -r.get("debt_to_equity", 999.0)))
+
+    best_by_priority = {
+        "growth": growth_pick,
+        "safety": safety_pick,
+        "value": value_pick,
+        "income": income_pick,
+        "balanced": max(rows, key=lambda r: (
+            (r.get("roe", 0.0) * 0.45)
+            + (r.get("net_profit_margin", 0.0) * 0.35)
+            - (r.get("debt_to_equity", 0.0) * 10.0)
+            - (r.get("pe_ratio", 0.0) * 0.05)
+        )),
+    }
+    chosen_priority = priority if priority in best_by_priority else "balanced"
+    best_pick = best_by_priority[chosen_priority]
+    return (
+        f"{best_pick['firm']} aligns best with {chosen_priority} priority. "
+        f"Quick context: ROE {best_pick['roe']:.1f}%, margin {best_pick['net_profit_margin']:.1f}%, "
+        f"D/E {best_pick['debt_to_equity']:.2f}, P/E {best_pick['pe_ratio']:.1f}."
+    )
+
+
+def get_firm_comparison_reply(normalized_text, original_text, include_sources=False):
+    """Return deterministic side-by-side firm comparison table plus coach verdict."""
+    targets = parse_comparison_targets(original_text)
+    if len(targets) < 2:
+        return ""
+
+    comparison_data = get_comparison_data(targets)
+    if len(comparison_data) < 2:
+        return ""
+
+    table = build_comparison_markdown_table(comparison_data)
+    priority = detect_comparison_priority(original_text)
+    verdict = build_coach_comparison_verdict(comparison_data, priority=priority)
+    reply = f"{table}\n\n{verdict}"
+    return with_citations(reply, ["Mock fundamentals + cached quote context"], include_sources)
 
 
 def to_float_or_none(value):
@@ -2576,10 +3341,11 @@ def build_dopamine_swap_offer(purchase_amount_usd=0.0):
     )
 
 
-def evaluate_behavioral_gate(user_message, user_state):
+def evaluate_behavioral_gate(user_message, user_state, user_id=DEFAULT_USER_ID):
     """Evaluate purchase psychology and activate a 12-hour circuit breaker when risky."""
     user_state = ensure_finance_profiles(user_state)
     profile = user_state.get("behavior_budget_profile") or {}
+    user_profile = user_state.get("profile") or {}
     now = datetime.now(timezone.utc)
 
     gate_until_raw = (profile.get("circuit_breaker_until") or "").strip()
@@ -2600,6 +3366,127 @@ def evaluate_behavioral_gate(user_message, user_state):
         "buy", "purchase", "spend", "pay", "checkout", "order", "cart", "want to buy", "i'm buying", "im buying",
     ]
     is_spending_intent = any(marker in lowered for marker in intent_markers)
+
+    locked_categories = {
+        normalize_intent_text(category or "").strip()
+        for category in (profile.get("locked_categories") or [])
+    }
+    locked_categories = {category for category in locked_categories if category}
+
+    pending_category = normalize_intent_text(profile.get("break_lock_confirm_category") or "").strip()
+    pending_until = parse_iso_datetime(profile.get("break_lock_confirm_until") or "")
+    try:
+        pending_step = int(profile.get("break_lock_confirm_step") or 0)
+    except Exception:
+        pending_step = 0
+    pending_step = max(0, min(3, pending_step))
+    if pending_until and now >= pending_until:
+        profile["break_lock_confirm_category"] = ""
+        profile["break_lock_confirm_until"] = ""
+        profile["break_lock_confirm_step"] = 0
+        pending_category = ""
+        pending_until = None
+        pending_step = 0
+
+    first_confirmation = re.search(r"\bi\s+confirm\s+break\s+lock(?!\s+again\b)(?:\s+for)?\s+([a-zA-Z ]{2,40})\b", lowered)
+    if first_confirmation:
+        confirm_category = normalize_intent_text(first_confirmation.group(1) or "").strip()
+        if confirm_category and confirm_category in locked_categories:
+            if pending_category == confirm_category and pending_until is not None and now < pending_until and pending_step == 1:
+                profile["break_lock_confirm_step"] = 2
+                user_state["behavior_budget_profile"] = profile
+                return {
+                    "active": True,
+                    "just_triggered": False,
+                    "until": profile.get("break_lock_confirm_until") or "",
+                    "warning": "First override confirmation accepted; second explicit confirmation required.",
+                    "message": (
+                        f"Step 1/2 accepted for '{confirm_category}'. To proceed, type exactly: "
+                        f"I CONFIRM BREAK LOCK AGAIN {confirm_category}"
+                    ),
+                    "state": user_state,
+                }
+            return {
+                "active": True,
+                "just_triggered": False,
+                "until": profile.get("break_lock_confirm_until") or "",
+                "warning": "Override confirmation attempted before guardrail challenge was armed.",
+                "message": (
+                    f"No active lock-break challenge found for '{confirm_category}'. "
+                    "Attempt the locked spend first to arm the two-step confirmation window."
+                ),
+                "state": user_state,
+            }
+
+    second_confirmation = re.search(r"\bi\s+confirm\s+break\s+lock\s+again(?:\s+for)?\s+([a-zA-Z ]{2,40})\b", lowered)
+    if second_confirmation:
+        confirm_category = normalize_intent_text(second_confirmation.group(1) or "").strip()
+        if confirm_category and confirm_category in locked_categories:
+            if pending_category == confirm_category and pending_until is not None and now < pending_until and pending_step == 2:
+                profile["break_lock_confirm_step"] = 3
+                user_state["behavior_budget_profile"] = profile
+                return {
+                    "active": True,
+                    "just_triggered": False,
+                    "until": profile.get("break_lock_confirm_until") or "",
+                    "warning": "Second override confirmation accepted; temporary override is armed.",
+                    "message": (
+                        f"Step 2/2 accepted for '{confirm_category}'. Override is armed for 10 minutes. "
+                        "If you still choose to spend, send your purchase now."
+                    ),
+                    "state": user_state,
+                }
+            return {
+                "active": True,
+                "just_triggered": False,
+                "until": profile.get("break_lock_confirm_until") or "",
+                "warning": "Second confirmation rejected because first confirmation is missing or expired.",
+                "message": (
+                    f"Second confirmation for '{confirm_category}' was rejected. "
+                    f"Start again with: I CONFIRM BREAK LOCK {confirm_category}"
+                ),
+                "state": user_state,
+            }
+
+    detected_category = ""
+    parsed_spend = parse_spend_log_payload(user_message)
+    if parsed_spend:
+        detected_category = normalize_intent_text(parsed_spend.get("category") or "").strip()
+    if not detected_category:
+        detected_category = extract_spend_category_hint(user_message)
+
+    if is_spending_intent and detected_category and detected_category in locked_categories:
+        has_valid_override = (
+            pending_category == detected_category
+            and pending_until is not None
+            and now < pending_until
+            and pending_step == 3
+        )
+        if has_valid_override:
+            profile["break_lock_confirm_category"] = ""
+            profile["break_lock_confirm_until"] = ""
+            profile["break_lock_confirm_step"] = 0
+            user_state["behavior_budget_profile"] = profile
+            analytics_sql_insert_guardrail_override(user_id, detected_category, created_at=utc_now_iso())
+        else:
+            profile["break_lock_confirm_category"] = detected_category
+            profile["break_lock_confirm_until"] = (now + timedelta(minutes=10)).isoformat()
+            profile["break_lock_confirm_step"] = 1
+            user_state["behavior_budget_profile"] = profile
+            accountability_target = (user_profile.get("accountability_target") or "").strip()
+            target_tail = f" Goal on the line: {accountability_target}." if accountability_target else ""
+            return {
+                "active": True,
+                "just_triggered": True,
+                "until": profile["break_lock_confirm_until"],
+                "warning": "Locked spending category attempted; require two explicit manual confirmations.",
+                "message": (
+                    f"Hard stop: '{detected_category}' is a locked category you explicitly set.{target_tail} "
+                    "To proceed, type exactly (step 1/2): "
+                    f"I CONFIRM BREAK LOCK {detected_category}"
+                ),
+                "state": user_state,
+            }
 
     raw_json = parse_purchase_psychology(user_message)
     try:
@@ -2931,7 +3818,12 @@ def fetch_live_quotes(symbols):
         for symbol in requested:
             cached = finance_quote_cache.get(symbol)
             if cached and now_ts - cached.get("cached_at", 0) <= FINANCE_QUOTE_CACHE_TTL_SECONDS:
-                quotes[symbol] = cached.get("quote") or {}
+                recovered = dict(cached.get("quote") or {})
+                cached_at = float(cached.get("cached_at") or 0.0)
+                recovered["from_cache"] = True
+                recovered["cache_age_seconds"] = max(0.0, now_ts - cached_at) if cached_at else 0.0
+                recovered["last_known_utc"] = datetime.fromtimestamp(cached_at, tz=timezone.utc).isoformat() if cached_at else ""
+                quotes[symbol] = recovered
             else:
                 missing.append(symbol)
 
@@ -2988,6 +3880,7 @@ def fetch_live_quotes(symbols):
         with finance_cache_lock:
             for symbol, quote in quotes.items():
                 if symbol in requested:
+                    quote["from_cache"] = False
                     finance_quote_cache[symbol] = {
                         "cached_at": now_cached_at,
                         "quote": quote,
@@ -3004,6 +3897,7 @@ def fetch_live_quotes(symbols):
                 recovered = dict(cached.get("quote") or {})
                 cached_at = float(cached.get("cached_at") or 0.0)
                 recovered["stale"] = True
+                recovered["from_cache"] = True
                 recovered["cache_age_seconds"] = max(0.0, time.time() - cached_at) if cached_at else None
                 recovered["last_known_utc"] = datetime.fromtimestamp(cached_at, tz=timezone.utc).isoformat() if cached_at else ""
                 quotes[symbol] = recovered
@@ -3012,6 +3906,8 @@ def fetch_live_quotes(symbols):
     for symbol, quote in quotes.items():
         if "stale" not in quote:
             quote["stale"] = False
+        if "from_cache" not in quote:
+            quote["from_cache"] = False
 
     return quotes, source_url
 
@@ -3025,6 +3921,37 @@ def format_quote_timestamp(market_time):
         return dt.strftime("%Y-%m-%d %H:%M UTC")
     except Exception:
         return "unknown"
+
+
+def quote_as_of_label(quote):
+    """Get an explicit as-of label for quote values."""
+    market_label = format_quote_timestamp((quote or {}).get("market_time"))
+    if market_label != "unknown":
+        return market_label
+    last_known = ((quote or {}).get("last_known_utc") or "").strip()
+    return last_known or "unknown"
+
+
+def quote_freshness_label(quote):
+    """Classify quote source freshness as live, cached, or cached-stale."""
+    q = quote or {}
+    if bool(q.get("stale")):
+        return "cached-stale"
+    if bool(q.get("from_cache")):
+        return "cached"
+    return "live"
+
+
+def build_market_data_unavailable_message(symbols=None):
+    """Return a user-facing quote fallback message for API/timeouts."""
+    normalized = [normalize_ticker_symbol(s) for s in (symbols or [])]
+    normalized = [s for s in normalized if s]
+    if not normalized:
+        return MARKET_DATA_UNAVAILABLE_RETRY_MESSAGE
+    return (
+        f"{MARKET_DATA_UNAVAILABLE_RETRY_MESSAGE} "
+        f"Requested symbols: {', '.join(normalized)}."
+    )
 
 
 def is_portfolio_comparison_query(normalized_text, original_text):
@@ -3112,6 +4039,7 @@ def summarize_portfolio(portfolio, quotes, investment_amount):
     weighted_beta = 0.0
     beta_weight_sum = 0.0
     missing = []
+    freshness_states = []
 
     for ticker, weight in holdings.items():
         quote = quotes.get(ticker) or {}
@@ -3138,7 +4066,10 @@ def summarize_portfolio(portfolio, quotes, investment_amount):
             "change_pct": float(change_pct) if isinstance(change_pct, (int, float)) else None,
             "allocation_value": allocation_value,
             "shares": shares,
+            "as_of_label": quote_as_of_label(quote),
+            "data_freshness": quote_freshness_label(quote),
         })
+        freshness_states.append(quote_freshness_label(quote))
 
     if hhi < 0.18:
         diversification = "diversified"
@@ -3159,6 +4090,13 @@ def summarize_portfolio(portfolio, quotes, investment_amount):
     else:
         risk_band = "high-volatility"
 
+    if not freshness_states:
+        portfolio_data_freshness = "unknown"
+    elif all(state == freshness_states[0] for state in freshness_states):
+        portfolio_data_freshness = freshness_states[0]
+    else:
+        portfolio_data_freshness = "mixed"
+
     return {
         "name": name,
         "rows": rows,
@@ -3167,6 +4105,7 @@ def summarize_portfolio(portfolio, quotes, investment_amount):
         "diversification": diversification,
         "effective_beta": effective_beta,
         "risk_band": risk_band,
+        "data_freshness": portfolio_data_freshness,
         "missing": missing,
         "hhi": hhi,
     }
@@ -3185,16 +4124,16 @@ def get_portfolio_comparison_reply(normalized_text, original_text, include_sourc
     try:
         quotes, source_url = fetch_live_quotes(symbols)
     except Exception:
-        return build_no_excuses_analysis(original_text or normalized_text, include_sources=include_sources)
+        return build_market_data_unavailable_message(symbols)
 
     if not quotes:
-        return build_no_excuses_analysis(original_text or normalized_text, include_sources=include_sources)
+        return build_market_data_unavailable_message(symbols)
 
     investment_amount = extract_investment_amount_usd(original_text)
     summaries = [summarize_portfolio(p, quotes, investment_amount) for p in portfolios]
     valid = [s for s in summaries if s["rows"]]
     if not valid:
-        return "I found the portfolios but could not retrieve valid prices for their tickers."
+        return build_market_data_unavailable_message(symbols)
 
     best_momentum = max(valid, key=lambda s: s.get("weighted_change_pct", -9999))
     freshest_time = None
@@ -3202,13 +4141,20 @@ def get_portfolio_comparison_reply(normalized_text, original_text, include_sourc
         market_time = quote.get("market_time")
         if isinstance(market_time, (int, float)):
             freshest_time = max(freshest_time or 0, int(market_time))
+    freshest_label = format_quote_timestamp(freshest_time)
+    if freshest_label == "unknown":
+        for quote in quotes.values():
+            fallback_label = quote_as_of_label(quote)
+            if fallback_label != "unknown":
+                freshest_label = fallback_label
+                break
 
     lines = []
     lines.append(
         "Portfolio comparison using latest market quotes. "
         f"Data refreshes about every {FINANCE_QUOTE_CACHE_TTL_SECONDS} seconds in this app."
     )
-    lines.append(f"Most recent market timestamp observed: {format_quote_timestamp(freshest_time)}.")
+    lines.append(f"Most recent market timestamp observed: {freshest_label}.")
     lines.append(f"Assumed investment per portfolio: ${investment_amount:,.2f}.")
 
     for summary in valid:
@@ -3216,7 +4162,7 @@ def get_portfolio_comparison_reply(normalized_text, original_text, include_sourc
         lines.append(
             f"{summary['name']}: weighted intraday change {summary['weighted_change_pct']:+.2f}% | "
             f"weighted price ${summary['weighted_price']:.2f} | {summary['diversification']} | "
-            f"risk {summary['risk_band']}"
+            f"risk {summary['risk_band']} | as of {freshest_label} | data {summary['data_freshness']}"
         )
         if summary.get("effective_beta") is not None:
             lines.append(f"- beta proxy: {summary['effective_beta']:.2f}")
@@ -3224,7 +4170,7 @@ def get_portfolio_comparison_reply(normalized_text, original_text, include_sourc
             change_text = f"{row['change_pct']:+.2f}%" if row["change_pct"] is not None else "n/a"
             lines.append(
                 f"- {row['ticker']}: {row['weight_pct']:.1f}% | ${row['price']:.2f} | change {change_text} | "
-                f"alloc ${row['allocation_value']:.2f}"
+                f"alloc ${row['allocation_value']:.2f} | as of {row['as_of_label']} | data {row['data_freshness']}"
             )
         if summary["missing"]:
             lines.append(f"- Missing quotes: {', '.join(summary['missing'])}")
@@ -3261,36 +4207,31 @@ def get_live_quote_reply(normalized_text, original_text, include_sources=False):
     try:
         quotes, source_url = fetch_live_quotes(symbols)
     except Exception:
-        fallback_query = f"latest stock price {', '.join(symbols)}"
-        fallback = get_web_search_reply(fallback_query, include_sources=include_sources)
-        if fallback and not is_weak_web_response(fallback):
-            return fallback
-        return build_no_excuses_analysis(original_text or normalized_text, include_sources=include_sources)
+        return build_market_data_unavailable_message(symbols)
 
     if not quotes:
-        fallback_query = f"latest stock price {', '.join(symbols)}"
-        fallback = get_web_search_reply(fallback_query, include_sources=include_sources)
-        if fallback and not is_weak_web_response(fallback):
-            return fallback
-        return build_no_excuses_analysis(original_text or normalized_text, include_sources=include_sources)
+        return build_market_data_unavailable_message(symbols)
 
     lines = []
     lines.append(
         "Latest stock quotes (live or most recent market print). "
         f"Refresh cadence in this app is about every {FINANCE_QUOTE_CACHE_TTL_SECONDS} seconds."
     )
+    available_count = 0
     for symbol in symbols:
         quote = quotes.get(symbol) or {}
         price = quote.get("price")
         if price is None:
-            lines.append(f"- {symbol}: quote unavailable")
+            lines.append(f"- {symbol}: data unavailable, try again.")
             continue
+        available_count += 1
         name = quote.get("name") or symbol
         currency = quote.get("currency") or "USD"
         exchange = quote.get("exchange") or ""
         change_pct = quote.get("change_percent")
         change_text = f"{change_pct:+.2f}%" if isinstance(change_pct, (int, float)) else "n/a"
-        market_ts_text = format_quote_timestamp(quote.get("market_time"))
+        as_of_label = quote_as_of_label(quote)
+        freshness = quote_freshness_label(quote)
         exchange_part = f" on {exchange}" if exchange else ""
         provider = (quote.get("provider") or "unknown").replace("_", " ")
         stale = bool(quote.get("stale"))
@@ -3300,12 +4241,15 @@ def get_live_quote_reply(normalized_text, original_text, include_sources=False):
             age_text = f"{int(age)}s" if isinstance(age, (int, float)) else "unknown"
             lines.append(
                 f"- {symbol} ({name}): last known {price:.2f} {currency}{exchange_part} | change {change_text} | "
-                f"market as of {market_ts_text} | cached at {last_known} ({age_text} ago) | provider {provider}"
+                f"as of {as_of_label} | data {freshness} | cached at {last_known} ({age_text} ago) | provider {provider}"
             )
         else:
             lines.append(
-                f"- {symbol} ({name}): {price:.2f} {currency}{exchange_part} | change {change_text} | as of {market_ts_text} | provider {provider}"
+                f"- {symbol} ({name}): {price:.2f} {currency}{exchange_part} | change {change_text} | as of {as_of_label} | data {freshness} | provider {provider}"
             )
+
+    if available_count == 0:
+        return build_market_data_unavailable_message(symbols)
 
     lines.append("If you want, I can keep tracking a watchlist and compare updates minute by minute.")
     sources = [source_url] if source_url else ["https://finance.yahoo.com/"]
@@ -3314,6 +4258,11 @@ def get_live_quote_reply(normalized_text, original_text, include_sources=False):
 
 def get_finance_reply(normalized_text, original_text, include_sources=False):
     """Handle finance/economics queries around quotes and portfolio comparison."""
+    if "portfolio" not in normalized_text and any(m in normalized_text for m in ["compare", "comparison", "vs", "versus"]):
+        comparison_reply = get_firm_comparison_reply(normalized_text, original_text, include_sources=include_sources)
+        if comparison_reply:
+            return comparison_reply
+
     if is_portfolio_comparison_query(normalized_text, original_text):
         portfolio_reply = get_portfolio_comparison_reply(normalized_text, original_text, include_sources=include_sources)
         if portfolio_reply:
@@ -3343,6 +4292,16 @@ def ensure_finance_profiles(user_state):
     finance_profile.setdefault("watchlist_last_checked", "")
     finance_profile.setdefault("watchlist_last_snapshot", [])
     finance_profile.setdefault(
+        "cash_management",
+        {
+            "checking_balance_usd": 0.0,
+            "hysa_balance_usd": 0.0,
+            "hysa_apy": 0.045,
+            "last_idle_cash_sweep_at": "",
+            "last_idle_cash_sweep_amount": 0.0,
+        },
+    )
+    finance_profile.setdefault(
         "runway_buffer_profile",
         {
             "base_city": BASELINE_COST_INDEX_CITY,
@@ -3362,6 +4321,16 @@ def ensure_finance_profiles(user_state):
         if normalized and normalized not in normalized_watchlist:
             normalized_watchlist.append(normalized)
     finance_profile["watchlist"] = normalized_watchlist[:60]
+    cash_profile = finance_profile.get("cash_management") or {}
+    finance_profile["cash_management"] = {
+        "checking_balance_usd": max(0.0, float(to_float_or_none(cash_profile.get("checking_balance_usd")) or 0.0)),
+        "hysa_balance_usd": max(0.0, float(to_float_or_none(cash_profile.get("hysa_balance_usd")) or 0.0)),
+        "hysa_apy": max(0.0, min(1.0, float(to_float_or_none(cash_profile.get("hysa_apy")) or 0.045))),
+        "last_idle_cash_sweep_at": str(cash_profile.get("last_idle_cash_sweep_at") or ""),
+        "last_idle_cash_sweep_amount": max(0.0, float(to_float_or_none(cash_profile.get("last_idle_cash_sweep_amount")) or 0.0)),
+        "hysa_auto_sweep_enabled": bool(cash_profile.get("hysa_auto_sweep_enabled", False)),
+        "hysa_auto_sweep_enabled_at": str(cash_profile.get("hysa_auto_sweep_enabled_at") or ""),
+    }
     runway_profile = finance_profile.get("runway_buffer_profile") or {}
     finance_profile["runway_buffer_profile"] = {
         "base_city": normalize_city_key(runway_profile.get("base_city") or BASELINE_COST_INDEX_CITY) or BASELINE_COST_INDEX_CITY,
@@ -3381,6 +4350,7 @@ def ensure_finance_profiles(user_state):
     subscription_profile.setdefault("last_alert_at", "")
     subscription_profile.setdefault("last_vampire_scan_at", "")
     subscription_profile.setdefault("vampire_alerts", [])
+    subscription_profile.setdefault("pending_cancellation_review", {})
 
     goal = subscription_profile.get("savings_goal") or {}
     goal_name = (goal.get("name") or "").strip()
@@ -3432,6 +4402,16 @@ def ensure_finance_profiles(user_state):
             "message": (item.get("message") or "").strip(),
         })
     subscription_profile["vampire_alerts"] = cleaned_alerts[:50]
+    pending_review = subscription_profile.get("pending_cancellation_review") or {}
+    if not isinstance(pending_review, dict):
+        pending_review = {}
+    subscription_profile["pending_cancellation_review"] = {
+        "service_name": str(pending_review.get("service_name") or ""),
+        "review_token": str(pending_review.get("review_token") or ""),
+        "expires_at": str(pending_review.get("expires_at") or ""),
+        "created_at": str(pending_review.get("created_at") or ""),
+        "draft": pending_review.get("draft") if isinstance(pending_review.get("draft"), dict) else {},
+    }
 
     behavior_profile = user_state.get("behavior_budget_profile")
     if not isinstance(behavior_profile, dict):
@@ -3439,6 +4419,10 @@ def ensure_finance_profiles(user_state):
     behavior_profile.setdefault("spend_events", [])
     behavior_profile.setdefault("last_coach_alert_at", "")
     behavior_profile.setdefault("last_daily_alert_date", "")
+    behavior_profile.setdefault("locked_categories", [])
+    behavior_profile.setdefault("break_lock_confirm_category", "")
+    behavior_profile.setdefault("break_lock_confirm_until", "")
+    behavior_profile.setdefault("break_lock_confirm_step", 0)
     behavior_profile.setdefault("opportunity_cost_threshold_usd", OPPORTUNITY_COST_THRESHOLD_USD)
     behavior_profile.setdefault("opportunity_cost_default_years", OPPORTUNITY_COST_DEFAULT_YEARS)
     behavior_profile.setdefault("opportunity_cost_default_annual_return", OPPORTUNITY_COST_DEFAULT_ANNUAL_RETURN)
@@ -3465,6 +4449,26 @@ def ensure_finance_profiles(user_state):
         behavior_profile["opportunity_cost_default_annual_return"] = OPPORTUNITY_COST_DEFAULT_ANNUAL_RETURN
     if not isinstance(behavior_profile.get("last_opportunity_cost_gate"), dict):
         behavior_profile["last_opportunity_cost_gate"] = {}
+    if not isinstance(behavior_profile.get("locked_categories"), list):
+        behavior_profile["locked_categories"] = []
+    cleaned_locked_categories = []
+    for category in behavior_profile.get("locked_categories") or []:
+        normalized_category = normalize_intent_text(category or "").strip()
+        if normalized_category and normalized_category not in cleaned_locked_categories:
+            cleaned_locked_categories.append(normalized_category)
+    behavior_profile["locked_categories"] = cleaned_locked_categories[:20]
+    if not isinstance(behavior_profile.get("break_lock_confirm_category"), str):
+        behavior_profile["break_lock_confirm_category"] = ""
+    behavior_profile["break_lock_confirm_category"] = normalize_intent_text(
+        behavior_profile.get("break_lock_confirm_category") or ""
+    ).strip()
+    if not isinstance(behavior_profile.get("break_lock_confirm_until"), str):
+        behavior_profile["break_lock_confirm_until"] = ""
+    try:
+        behavior_profile["break_lock_confirm_step"] = int(behavior_profile.get("break_lock_confirm_step") or 0)
+    except Exception:
+        behavior_profile["break_lock_confirm_step"] = 0
+    behavior_profile["break_lock_confirm_step"] = max(0, min(3, behavior_profile["break_lock_confirm_step"]))
     if not isinstance(behavior_profile.get("circuit_breaker_active"), bool):
         behavior_profile["circuit_breaker_active"] = False
     if not isinstance(behavior_profile.get("circuit_breaker_until"), str):
@@ -3826,10 +4830,10 @@ def get_watchlist_summary_reply(user_state, include_sources=False):
     try:
         quotes, source_url = fetch_live_quotes(watchlist)
     except Exception:
-        return "I could not fetch your watchlist prices right now."
+        return build_market_data_unavailable_message(watchlist)
 
     if not quotes:
-        return "I could not fetch your watchlist prices right now."
+        return build_market_data_unavailable_message(watchlist)
 
     lines = [
         "Watchlist snapshot (latest market values):",
@@ -3840,17 +4844,20 @@ def get_watchlist_summary_reply(user_state, include_sources=False):
         quote = quotes.get(symbol) or {}
         price = quote.get("price")
         if price is None:
-            lines.append(f"- {symbol}: unavailable")
+            lines.append(f"- {symbol}: data unavailable, try again.")
             continue
         change_pct = quote.get("change_percent")
         change_text = f"{change_pct:+.2f}%" if isinstance(change_pct, (int, float)) else "n/a"
-        market_text = format_quote_timestamp(quote.get("market_time"))
-        lines.append(f"- {symbol}: ${float(price):.2f} | change {change_text} | as of {market_text}")
+        as_of_label = quote_as_of_label(quote)
+        freshness = quote_freshness_label(quote)
+        lines.append(f"- {symbol}: ${float(price):.2f} | change {change_text} | as of {as_of_label} | data {freshness}")
         snapshot_rows.append({
             "symbol": symbol,
             "price": float(price),
             "change_percent": float(change_pct) if isinstance(change_pct, (int, float)) else None,
             "market_time": quote.get("market_time"),
+            "as_of_label": f"as of {as_of_label}",
+            "data_freshness": freshness,
         })
 
     finance_profile["watchlist_last_checked"] = utc_now_iso()
@@ -4195,6 +5202,51 @@ def infer_stress_level(text):
     return "medium"
 
 
+def extract_spend_category_hint(user_message):
+    """Best-effort category hint when user expresses spend intent without logging format."""
+    normalized = normalize_intent_text(user_message)
+    if not normalized:
+        return ""
+
+    keyword_to_category = {
+        "takeout": "takeout",
+        "restaurant": "food",
+        "food": "food",
+        "groceries": "groceries",
+        "grocery": "groceries",
+        "uber": "transport",
+        "lyft": "transport",
+        "taxi": "transport",
+        "transport": "transport",
+        "bus": "transport",
+        "train": "transport",
+        "movie": "entertainment",
+        "netflix": "entertainment",
+        "spotify": "entertainment",
+        "concert": "entertainment",
+        "game": "entertainment",
+        "gaming": "entertainment",
+        "shopping": "shopping",
+        "amazon": "shopping",
+        "shoes": "shopping",
+        "sneakers": "shopping",
+        "clothes": "shopping",
+        "clothing": "shopping",
+        "fashion": "shopping",
+        "bag": "shopping",
+        "watch": "shopping",
+        "laptop": "shopping",
+        "phone": "shopping",
+        "subscription": "subscription",
+        "coffee": "coffee",
+        "drinks": "drinks",
+    }
+    for keyword, category in keyword_to_category.items():
+        if keyword in normalized:
+            return category
+    return ""
+
+
 def parse_spend_log_payload(user_message):
     """Parse spend log command into normalized event payload."""
     text = user_message or ""
@@ -4371,6 +5423,51 @@ def apply_behavior_budget_command(user_state, user_message):
     user_state = ensure_finance_profiles(user_state)
     normalized = normalize_intent_text(user_message)
     behavior_profile = user_state.get("behavior_budget_profile") or {}
+    user_profile = user_state.get("profile") or {}
+
+    if any(x in normalized for x in ["accountability target", "set accountability", "goal target"]):
+        target_text = re.sub(r".*(?:accountability target|set accountability|goal target)", "", user_message, flags=re.IGNORECASE).strip(" :.-")
+        if not target_text:
+            return "Set it like: accountability target become debt-free by June.", False
+        user_profile["accountability_target"] = target_text
+        user_state["profile"] = user_profile
+        return f"Accountability target set: {target_text}.", True
+
+    if any(x in normalized for x in ["lock category", "category lock"]):
+        category_text = re.sub(r".*(?:lock category|category lock)", "", user_message, flags=re.IGNORECASE).strip(" :.-")
+        if not category_text:
+            return "Use: lock category shopping.", False
+        category = normalize_intent_text(category_text)
+        locked = behavior_profile.get("locked_categories") or []
+        if category not in locked:
+            locked.append(category)
+        behavior_profile["locked_categories"] = locked[:20]
+        behavior_profile["last_coach_alert_at"] = utc_now_iso()
+        user_state["behavior_budget_profile"] = behavior_profile
+        return f"Locked spending category: {category}.", True
+
+    if any(x in normalized for x in ["unlock category", "category unlock"]):
+        category_text = re.sub(r".*(?:unlock category|category unlock)", "", user_message, flags=re.IGNORECASE).strip(" :.-")
+        if not category_text:
+            return "Use: unlock category shopping.", False
+        category = normalize_intent_text(category_text)
+        before = len(behavior_profile.get("locked_categories") or [])
+        behavior_profile["locked_categories"] = [c for c in (behavior_profile.get("locked_categories") or []) if c != category]
+        if behavior_profile.get("break_lock_confirm_category") == category:
+            behavior_profile["break_lock_confirm_category"] = ""
+            behavior_profile["break_lock_confirm_until"] = ""
+            behavior_profile["break_lock_confirm_step"] = 0
+        behavior_profile["last_coach_alert_at"] = utc_now_iso()
+        user_state["behavior_budget_profile"] = behavior_profile
+        if len(behavior_profile["locked_categories"]) == before:
+            return "That category was not locked.", False
+        return f"Unlocked spending category: {category}.", True
+
+    if any(x in normalized for x in ["locked categories", "show locked", "list locked"]):
+        locked = behavior_profile.get("locked_categories") or []
+        if not locked:
+            return "No locked categories set.", False
+        return "Locked categories: " + ", ".join(locked), False
 
     if any(x in normalized for x in ["behavior summary", "spending triggers", "show triggers", "budget psychology", "behavioral budgeting"]):
         return build_behavioral_budget_summary(user_state), False
@@ -4530,6 +5627,9 @@ def get_personal_finance_feature_reply(user_message, user_state, user_id=DEFAULT
     user_state = ensure_finance_profiles(user_state)
     normalized = normalize_intent_text(user_message)
 
+    if is_direct_investment_allocation_query(normalized):
+        return build_investment_allocation_baseline_reply(include_sources=include_sources), False
+
     # Two-engine architecture:
     # 1) Linguistic engine parses natural language into structured analytical intent.
     # 2) Analytical engine executes deterministic math/state/SQL logic.
@@ -4559,18 +5659,6 @@ def get_personal_finance_feature_reply(user_message, user_state, user_id=DEFAULT
     behavior_reply, behavior_changed = apply_behavior_budget_command(user_state, user_message)
     if behavior_reply:
         return behavior_reply, (behavior_changed or True)
-
-    # Proactive decay alert for finance-oriented prompts.
-    if any(marker in normalized for marker in ["finance", "econom", "portfolio", "stock", "market"]):
-        alert_parts = []
-        sub_alert = build_subscription_decay_report(user_state, include_sources=include_sources)
-        if sub_alert and "No subscriptions tracked" not in sub_alert:
-            alert_parts.append(sub_alert)
-        coach_nudge = build_empathetic_budget_nudge(user_state)
-        if coach_nudge:
-            alert_parts.append(coach_nudge)
-        if alert_parts:
-            return "\n\n".join(alert_parts), True
 
     return "", False
 
@@ -4684,10 +5772,12 @@ def build_weekly_finance_report_lines(user_state, user_id=DEFAULT_USER_ID):
             price = quote.get("price")
             change = quote.get("change_percent")
             if price is None:
-                lines.append(f"- {symbol}: unavailable")
+                lines.append(f"- {symbol}: data unavailable, try again.")
                 continue
             change_text = f"{change:+.2f}%" if isinstance(change, (int, float)) else "n/a"
-            lines.append(f"- {symbol}: ${float(price):.2f} ({change_text})")
+            as_of_label = quote_as_of_label(quote)
+            freshness = quote_freshness_label(quote)
+            lines.append(f"- {symbol}: ${float(price):.2f} ({change_text}) | as of {as_of_label} | data {freshness}")
     else:
         lines.append("- No watchlist symbols configured.")
 
@@ -4828,6 +5918,115 @@ def analytics_sql_insert_spend_event(user_id, event):
             conn.close()
 
 
+def analytics_sql_insert_guardrail_override(user_id, category, created_at=None):
+    """Log each consumed spending-guardrail override."""
+    ensure_analytics_db()
+    with analytics_db_lock:
+        conn = open_analytics_db()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO guardrail_overrides (user_id, category, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    sanitize_user_id(user_id),
+                    normalize_intent_text(category or "other").strip() or "other",
+                    created_at or utc_now_iso(),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def analytics_sql_insert_cancellation_send(user_id, service_name, draft, confirmation_ts=None):
+    """Log a confirmed cancellation submission with draft payload."""
+    ensure_analytics_db()
+    with analytics_db_lock:
+        conn = open_analytics_db()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO cancellation_sends (
+                    user_id, service_name, draft_subject, draft_body, confirmation_ts
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    sanitize_user_id(user_id),
+                    (service_name or "").strip() or "unknown",
+                    str((draft or {}).get("subject") or ""),
+                    str((draft or {}).get("body") or ""),
+                    confirmation_ts or utc_now_iso(),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def analytics_sql_fetch_user_activity_log(user_id, limit=100):
+    """Return audit activity rows for overrides and cancellation sends."""
+    ensure_analytics_db()
+    safe_limit = max(1, min(200, int(to_float_or_none(limit) or 100)))
+    overrides = []
+    cancellations = []
+
+    with analytics_db_lock:
+        conn = open_analytics_db()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT category, created_at
+                FROM guardrail_overrides
+                WHERE user_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (sanitize_user_id(user_id), safe_limit),
+            )
+            for row in cur.fetchall() or []:
+                overrides.append(
+                    {
+                        "category": str((row[0] if len(row) > 0 else "") or "other"),
+                        "created_at": str((row[1] if len(row) > 1 else "") or ""),
+                    }
+                )
+
+            cur.execute(
+                """
+                SELECT service_name, draft_subject, confirmation_ts
+                FROM cancellation_sends
+                WHERE user_id = ?
+                ORDER BY confirmation_ts DESC
+                LIMIT ?
+                """,
+                (sanitize_user_id(user_id), safe_limit),
+            )
+            for row in cur.fetchall() or []:
+                cancellations.append(
+                    {
+                        "service_name": str((row[0] if len(row) > 0 else "") or ""),
+                        "draft_subject": str((row[1] if len(row) > 1 else "") or ""),
+                        "confirmation_ts": str((row[2] if len(row) > 2 else "") or ""),
+                    }
+                )
+        except Exception:
+            overrides = []
+            cancellations = []
+        finally:
+            conn.close()
+
+    return {
+        "overrides": overrides,
+        "cancellations": cancellations,
+    }
+
+
 def analytics_sql_behavior_insights(user_id):
     """Compute behavioral spending aggregates using SQL."""
     ensure_analytics_db()
@@ -4895,6 +6094,111 @@ def analytics_sql_behavior_insights(user_id):
             }
         finally:
             conn.close()
+
+
+def find_subscriptions(user_id):
+    """Find likely monthly subscriptions from spend_events using SQL only."""
+    ensure_analytics_db()
+    with analytics_db_lock:
+        conn = open_analytics_db()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                WITH grouped AS (
+                    SELECT
+                        category,
+                        ROUND(amount, 2) AS amount_key,
+                        COUNT(*) AS hit_count,
+                        MIN(created_at) AS first_at,
+                        MAX(created_at) AS last_at
+                    FROM spend_events
+                    WHERE user_id = ?
+                      AND amount > 0
+                      AND created_at >= datetime('now', '-180 day')
+                    GROUP BY category, ROUND(amount, 2)
+                    HAVING COUNT(*) >= 3
+                ),
+                recurring AS (
+                    SELECT
+                        category,
+                        amount_key,
+                        hit_count,
+                        (julianday(last_at) - julianday(first_at)) AS span_days,
+                        CASE
+                            WHEN hit_count > 1 THEN (julianday(last_at) - julianday(first_at)) / (hit_count - 1)
+                            ELSE 0
+                        END AS avg_gap_days,
+                        last_at
+                    FROM grouped
+                )
+                SELECT category, amount_key, hit_count, avg_gap_days, last_at
+                FROM recurring
+                WHERE span_days >= 55
+                  AND avg_gap_days BETWEEN 24 AND 36
+                ORDER BY hit_count DESC, last_at DESC
+                LIMIT 1
+                """,
+                (user_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            category = (row[0] or "other").strip() or "other"
+            merchant = category.replace("_", " ").title()
+            return {
+                "merchant": merchant,
+                "amount": float(row[1] or 0.0),
+                "hit_count": int(row[2] or 0),
+                "avg_gap_days": float(row[3] or 0.0),
+            }
+        finally:
+            conn.close()
+
+
+def maybe_get_witty_subscription_alert(user_state, user_id, now_dt=None):
+    """Return a low-frequency witty subscription alert from SQL spend history."""
+    user_state = ensure_finance_profiles(user_state)
+    now_dt = now_dt or datetime.now(timezone.utc)
+    subscription_profile = user_state.get("subscription_profile") or {}
+
+    last_scan = parse_iso_datetime(subscription_profile.get("last_sql_subscription_scan_at") or "")
+    if last_scan and (now_dt - last_scan).total_seconds() < 6 * 3600:
+        return "", False
+
+    candidate = find_subscriptions(user_id)
+    subscription_profile["last_sql_subscription_scan_at"] = utc_now_iso()
+    if not candidate:
+        user_state["subscription_profile"] = subscription_profile
+        return "", True
+
+    amount = max(0.0, float(candidate.get("amount") or 0.0))
+    merchant = (candidate.get("merchant") or "that merchant").strip() or "that merchant"
+    signature = f"{merchant.lower()}|{amount:.2f}"
+
+    last_signature = (subscription_profile.get("last_sql_subscription_alert_signature") or "").strip()
+    last_alert = parse_iso_datetime(subscription_profile.get("last_sql_subscription_alert_at") or "")
+    if signature == last_signature and last_alert and (now_dt - last_alert).days < 14:
+        user_state["subscription_profile"] = subscription_profile
+        return "", True
+
+    subscription_profile["last_sql_subscription_alert_signature"] = signature
+    subscription_profile["last_sql_subscription_alert_at"] = utc_now_iso()
+    user_state["subscription_profile"] = subscription_profile
+    return f"You've paid ${amount:.2f} to {merchant} 3 months straight. Cancel it or invest it?", True
+
+
+def merge_witty_alert(reply_text, alert_text):
+    """Prefix reply with subscription alert without duplicating text."""
+    alert = (alert_text or "").strip()
+    reply = (reply_text or "").strip()
+    if not alert:
+        return reply
+    if not reply:
+        return alert
+    if alert in reply:
+        return reply
+    return f"{alert}\n\n{reply}"
 
 
 def analytics_sql_weekly_mood_spending_report(user_id):
@@ -6528,6 +7832,21 @@ def get_local_smart_reply(user_message, user_id=DEFAULT_USER_ID):
     words = set(re.findall(r"[a-z']+", normalized))
     wants_citations = is_citation_request(normalized)
 
+    if "uploaded attachment analysis:" in original_lower:
+        attachment_block = user_message.split("Uploaded attachment analysis:", 1)[-1].strip()
+        if attachment_block:
+            lines = [
+                "I read the upload. Main signal first:",
+                f"- {attachment_block.splitlines()[0][:220]}",
+            ]
+            if "subscription" in original_lower or "shopping" in original_lower or "budget" in original_lower:
+                lines.append("- The pattern is not subtle. Costs are creeping faster than discipline, and that always gets expensive later.")
+                lines.append("- Action: cut one recurring leak, cap one impulse category, and force every non-essential spend to compete with investing.")
+            else:
+                lines.append("- If a document needs uploading before a decision feels obvious, slow down and extract the key numbers before you move.")
+                lines.append("- Action: tell me what you want from the file: summarize, extract numbers, compare, or critique.")
+            return "\n".join(lines)
+
     user_state = load_user_state(user_id)
     finance_direct_reply, finance_changed = get_personal_finance_feature_reply(
         user_message,
@@ -7107,7 +8426,7 @@ p {{
 
 @app.route("/chat")
 def chat():
-    return """
+    response = make_response("""
 <!DOCTYPE html>
 <html>
 <head>
@@ -7247,6 +8566,21 @@ body {
     opacity: 0.85;
 }
 
+.activity-link {
+    display: inline-flex;
+    margin-top: 10px;
+    font-size: 13px;
+    color: #ffe8a6;
+    text-decoration: none;
+    border: 1px solid rgba(255,255,255,0.28);
+    border-radius: 999px;
+    padding: 6px 10px;
+}
+
+.activity-link:hover {
+    background: rgba(255,255,255,0.12);
+}
+
 .chat-body {
     height: 460px;
     overflow-y: auto;
@@ -7274,6 +8608,44 @@ body {
     align-self: flex-start;
     background: rgba(255,255,255,0.18);
     color: white;
+}
+
+.message.bot.typing {
+    padding: 10px 14px;
+    min-width: 64px;
+}
+
+.typing-dots {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.typing-dots span {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.9);
+    animation: dotPulse 1.1s infinite ease-in-out;
+}
+
+.typing-dots span:nth-child(2) {
+    animation-delay: 0.15s;
+}
+
+.typing-dots span:nth-child(3) {
+    animation-delay: 0.3s;
+}
+
+@keyframes dotPulse {
+    0%, 80%, 100% {
+        transform: translateY(0);
+        opacity: 0.35;
+    }
+    40% {
+        transform: translateY(-4px);
+        opacity: 1;
+    }
 }
 
 .chat-footer {
@@ -7368,6 +8740,8 @@ body {
             <input id="authName" type="text" maxlength="70" placeholder="Your name" />
             <label for="authEmail">Email</label>
             <input id="authEmail" type="email" maxlength="254" placeholder="you@example.com" />
+            <label for="authPassword">Password</label>
+            <input id="authPassword" type="password" minlength="8" maxlength="128" placeholder="At least 8 characters" />
         </div>
         <div class="auth-actions">
             <button id="authSubmit" class="auth-btn">Start Chatting</button>
@@ -7380,6 +8754,7 @@ body {
     <div class="chat-header">
         <h1>mini me, beta edition</h1>
         <p>you can type whatever, and i’ll answer like a lovely little menace.</p>
+        <a class="activity-link" href="/activity-log">View activity log</a>
     </div>
     <div class="chat-body" id="chatBody"></div>
     <div class="chat-footer">
@@ -7404,6 +8779,7 @@ const attachmentPreview = document.getElementById('attachmentPreview');
 const authOverlay = document.getElementById('authOverlay');
 const authNameInput = document.getElementById('authName');
 const authEmailInput = document.getElementById('authEmail');
+const authPasswordInput = document.getElementById('authPassword');
 const authSubmitBtn = document.getElementById('authSubmit');
 const authError = document.getElementById('authError');
 let isSending = false;
@@ -7412,6 +8788,36 @@ let isRegisteredSession = false;
 let selectedAttachments = [];
 const maxAttachments = 5;
 const maxAttachmentBytes = 6 * 1024 * 1024;
+let typingIndicator = null;
+
+async function refreshAuthSession() {
+    try {
+        const response = await fetch('/api/auth/refresh', {
+            method: 'POST',
+            credentials: 'same-origin'
+        });
+        return response.ok;
+    } catch (_) {
+        return false;
+    }
+}
+
+async function authFetchWithRefresh(url, init = {}, retry = true) {
+    const requestInit = {
+        credentials: 'same-origin',
+        ...init
+    };
+    let response = await fetch(url, requestInit);
+    if (response.status !== 401 || !retry) {
+        return response;
+    }
+    const refreshed = await refreshAuthSession();
+    if (!refreshed) {
+        return response;
+    }
+    response = await fetch(url, requestInit);
+    return response;
+}
 
 function renderAttachmentPreview() {
     attachmentPreview.innerHTML = '';
@@ -7430,7 +8836,7 @@ function renderAttachmentPreview() {
 
 async function ensureRegistration() {
     try {
-        const meResp = await fetch('/api/auth/me', { method: 'GET', credentials: 'same-origin' });
+        const meResp = await authFetchWithRefresh('/api/auth/me', { method: 'GET' });
         if (meResp.ok) {
             const meData = await meResp.json();
             userId = meData.user_id || 'guest';
@@ -7448,6 +8854,7 @@ async function ensureRegistration() {
     const storedName = (localStorage.getItem('mini_me_name') || '').trim();
     authNameInput.value = storedName;
     authEmailInput.value = '';
+    authPasswordInput.value = '';
     authError.textContent = '';
     authOverlay.classList.remove('hidden');
     authNameInput.focus();
@@ -7457,6 +8864,7 @@ async function ensureRegistration() {
 async function submitRegistrationFromModal() {
     const name = authNameInput.value.trim();
     const email = authEmailInput.value.trim();
+    const password = authPasswordInput.value;
 
     if (!name) {
         authError.textContent = 'Please enter your name.';
@@ -7466,6 +8874,11 @@ async function submitRegistrationFromModal() {
     if (!email) {
         authError.textContent = 'Please enter your email.';
         authEmailInput.focus();
+        return;
+    }
+    if (!password || password.length < 8) {
+        authError.textContent = 'Please enter a password with at least 8 characters.';
+        authPasswordInput.focus();
         return;
     }
 
@@ -7478,7 +8891,7 @@ async function submitRegistrationFromModal() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             credentials: 'same-origin',
-            body: JSON.stringify({ name, email })
+            body: JSON.stringify({ name, email, password })
         });
         const regData = await regResp.json();
         if (!regResp.ok) {
@@ -7508,6 +8921,23 @@ function addMessage(role, text) {
     chatBody.scrollTop = chatBody.scrollHeight;
 }
 
+function showTypingIndicator() {
+    hideTypingIndicator();
+    const div = document.createElement('div');
+    div.className = 'message bot typing';
+    div.innerHTML = '<div class="typing-dots" aria-label="AI is typing"><span></span><span></span><span></span></div>';
+    chatBody.appendChild(div);
+    chatBody.scrollTop = chatBody.scrollHeight;
+    typingIndicator = div;
+}
+
+function hideTypingIndicator() {
+    if (typingIndicator && typingIndicator.parentNode) {
+        typingIndicator.parentNode.removeChild(typingIndicator);
+    }
+    typingIndicator = null;
+}
+
 async function sendMessage() {
     if (!isRegisteredSession) {
         const ok = await ensureRegistration();
@@ -7532,6 +8962,7 @@ async function sendMessage() {
     selectedAttachments = [];
     attachmentInput.value = '';
     renderAttachmentPreview();
+    showTypingIndicator();
 
     try {
         const formData = new FormData();
@@ -7553,13 +8984,16 @@ async function sendMessage() {
             throw new Error(data.error || 'Failed to get response.');
         }
 
+        hideTypingIndicator();
         if (data.attachment_analysis_summary) {
             addMessage('bot', data.attachment_analysis_summary);
         }
         addMessage('bot', data.reply || "I'm sorry, I'm not able to help you with that.");
     } catch (error) {
+        hideTypingIndicator();
         addMessage('bot', error?.message || "Upload or reply failed. Please try again.");
     } finally {
+        hideTypingIndicator();
         isSending = false;
         sendBtn.disabled = false;
         sendBtn.textContent = 'send';
@@ -7603,22 +9037,220 @@ authEmailInput.addEventListener('keydown', (event) => {
         submitRegistrationFromModal();
     }
 });
+authPasswordInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+        event.preventDefault();
+        submitRegistrationFromModal();
+    }
+});
 
 addMessage('bot', 'hey pretty girl, what do you want to talk about? you can also type /feedback followed by tips so i improve over time.');
 ensureRegistration();
 </script>
 </body>
 </html>
-"""
+""")
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
+@app.route("/nudge-v2")
+def nudge_v2():
+    """Fresh uncached alias for the updated AI-only chat UI."""
+    response = chat()
+    return response
+
+
+@app.route("/activity-log")
+def activity_log_screen():
+    """Simple trust screen that surfaces key user audit history."""
+    response = make_response("""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Activity Log</title>
+<style>
+* { box-sizing: border-box; }
+body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: linear-gradient(180deg, #f7f8fb 0%, #eef1f7 100%);
+    color: #1f2937;
+}
+.wrap {
+    max-width: 920px;
+    margin: 0 auto;
+    padding: 28px 16px 40px;
+}
+h1 {
+    margin: 0 0 8px;
+    font-size: 30px;
+}
+.sub {
+    margin: 0 0 18px;
+    color: #4b5563;
+}
+.row {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 14px;
+}
+.card {
+    background: #ffffff;
+    border: 1px solid #e5e7eb;
+    border-radius: 14px;
+    padding: 14px;
+}
+.card h2 {
+    margin: 0 0 10px;
+    font-size: 18px;
+}
+.muted { color: #6b7280; font-size: 14px; }
+ul { margin: 0; padding-left: 18px; }
+li { margin: 6px 0; }
+.error {
+    border: 1px solid #fecaca;
+    background: #fff1f2;
+    color: #9f1239;
+    border-radius: 10px;
+    padding: 10px;
+    margin-bottom: 12px;
+}
+.top-links {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 16px;
+}
+.top-links a {
+    text-decoration: none;
+    border: 1px solid #d1d5db;
+    border-radius: 999px;
+    padding: 8px 12px;
+    color: #111827;
+    background: #fff;
+    font-size: 14px;
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+    <h1>Your Activity Log</h1>
+    <p class="sub">Transparency view for override history, sweep consent history, and sent cancellation requests.</p>
+    <div class="top-links">
+        <a href="/chat">Back to Chat</a>
+    </div>
+    <div id="error" class="error" style="display:none;"></div>
+    <div class="row">
+        <section class="card">
+            <h2>Override History</h2>
+            <ul id="overrideList"></ul>
+        </section>
+        <section class="card">
+            <h2>Sweep Consent History</h2>
+            <ul id="sweepList"></ul>
+        </section>
+        <section class="card">
+            <h2>Sent Cancellations</h2>
+            <ul id="cancelList"></ul>
+        </section>
+    </div>
+</div>
+<script>
+function fmtTs(ts) {
+    if (!ts) return 'unknown time';
+    const d = new Date(ts);
+    if (Number.isNaN(d.getTime())) return ts;
+    return d.toLocaleString();
+}
+
+function fillList(listEl, items, renderLine, emptyText) {
+    listEl.innerHTML = '';
+    if (!items || !items.length) {
+        const li = document.createElement('li');
+        li.className = 'muted';
+        li.textContent = emptyText;
+        listEl.appendChild(li);
+        return;
+    }
+    items.forEach((item) => {
+        const li = document.createElement('li');
+        li.textContent = renderLine(item);
+        listEl.appendChild(li);
+    });
+}
+
+async function loadActivityLog() {
+    const err = document.getElementById('error');
+    try {
+        const res = await fetch('/api/finance/activity-log', {
+            method: 'GET',
+            credentials: 'same-origin'
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            throw new Error(data.error || 'Failed to load activity log.');
+        }
+
+        fillList(
+            document.getElementById('overrideList'),
+            data.override_history || [],
+            (item) => `Category: ${item.category || 'other'} | ${fmtTs(item.created_at)}`,
+            'No override records yet.'
+        );
+
+        fillList(
+            document.getElementById('sweepList'),
+            data.sweep_consent_history || [],
+            (item) => `${item.enabled ? 'Enabled' : 'Disabled'} auto-sweep | ${fmtTs(item.changed_at)}`,
+            'No sweep consent changes recorded yet.'
+        );
+
+        fillList(
+            document.getElementById('cancelList'),
+            data.sent_cancellations || [],
+            (item) => `${item.service_name || 'unknown service'} | ${fmtTs(item.confirmation_ts)}`,
+            'No cancellation sends recorded yet.'
+        );
+    } catch (e) {
+        err.style.display = 'block';
+        err.textContent = e?.message || 'Could not load activity log right now.';
+    }
+}
+
+loadActivityLog();
+</script>
+</body>
+</html>
+""")
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
+def infer_auto_control_reason(reply_text):
+    """Return plain-language reason when an automatic guardrail/sweep was triggered."""
+    lowered = normalize_case(reply_text or "")
+    reasons = []
+    if any(marker in lowered for marker in ["hard stop", "locked category", "break lock", "lock-break challenge"]):
+        reasons.append("A locked spending category rule blocked this action until explicit override confirmations are completed.")
+    if any(marker in lowered for marker in ["wait 12 hours", "circuit breaker is active", "high-risk"]):
+        reasons.append("A cooldown is active because your spending pattern looked high-risk, so the system paused execution.")
+    if "swept $" in lowered and "hysa" in lowered:
+        reasons.append("Idle cash above your checking threshold was automatically swept into HYSA to reduce cash drag.")
+    return " ".join(reasons).strip()
 
 
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
     mark_user_activity()
+    disclaimer = "Informational only. Not financial advice."
     is_multipart = request.content_type and "multipart/form-data" in request.content_type
     request_limit = MAX_JSON_BODY_BYTES if not is_multipart else (MAX_JSON_BODY_BYTES + MAX_CHAT_ATTACHMENTS * MAX_ATTACHMENT_BYTES)
     if reject_large_request(request_limit):
-        return jsonify({"error": "Payload too large."}), 413
+        return jsonify({"error": "Payload too large.", "disclaimer": disclaimer, "reason": ""}), 413
     data = request.form.to_dict() if is_multipart else (request.get_json(silent=True) or {})
     user_message = (data.get("message") or "").strip()
     session_user_id = resolve_session_user_id()
@@ -7626,23 +9258,41 @@ def api_chat():
     remember_history = parse_bool(data.get("remember_history"), default=True)
     uploaded_files = request.files.getlist("attachments") if is_multipart else []
 
+    if (user_message or uploaded_files) and is_user_rate_limited(
+        user_id,
+        scope="chat-llm",
+        max_hits=CHAT_USER_RATE_LIMIT_MAX,
+        window_seconds=CHAT_USER_RATE_LIMIT_WINDOW,
+    ):
+        return jsonify({
+            "error": "Too many requests. Please wait before sending more messages.",
+            "disclaimer": disclaimer,
+            "reason": "Rate limit reached to prevent abuse and uncontrolled API costs.",
+        }), 429
+
     attachment_summaries = analyze_uploaded_files(uploaded_files)
     if attachment_summaries:
         attachment_block = "\n\nUploaded attachment analysis:\n" + "\n\n".join(attachment_summaries)
         user_message = f"{user_message or 'Please analyze these uploads.'}{attachment_block}"
 
     if not user_message:
-        return jsonify({"error": "Message is required."}), 400
+        return jsonify({"error": "Message is required.", "disclaimer": disclaimer, "reason": ""}), 400
 
     if should_use_simple_fallback(user_message):
-        return jsonify({"reply": "I'm sorry, I'm not able to help you with that."})
+        return jsonify({"reply": "I'm sorry, I'm not able to help you with that.", "disclaimer": disclaimer, "reason": ""})
 
-    reply = get_ai_response_sync(user_message, user_id=user_id, remember_history=remember_history)
+    try:
+        reply = get_ai_response_sync(user_message, user_id=user_id, remember_history=remember_history)
+    except Exception:
+        reply = DATA_UNAVAILABLE_RETRY_MESSAGE
+    reason = infer_auto_control_reason(reply)
     return jsonify({
         "reply": reply,
         "user_id": user_id,
         "remember_history": remember_history,
         "attachment_analysis_summary": "\n\n".join(attachment_summaries[:3]) if attachment_summaries else "",
+        "disclaimer": disclaimer,
+        "reason": reason,
     })
 
 
@@ -7677,11 +9327,15 @@ def api_auth_register():
     data = request.get_json(silent=True) or {}
     email = sanitize_email(data.get("email"))
     name = (data.get("name") or "").strip()
+    password = data.get("password") or ""
+    accountability_target = (data.get("accountability_target") or "").strip()
 
     if not is_valid_email(email):
         return jsonify({"error": "Valid email is required."}), 400
     if not is_valid_display_name(name):
         return jsonify({"error": "Valid name is required (2-70 chars)."}), 400
+    if not is_valid_password(password):
+        return jsonify({"error": "Password must be 8-128 characters."}), 400
 
     e_hash = email_hash(email)
     accounts = load_accounts()
@@ -7689,33 +9343,79 @@ def api_auth_register():
 
     existing = accounts.get(e_hash) or {}
     created_at = existing.get("created_at") or utc_now_iso()
+    existing_hash = existing.get("password_hash") or ""
+    if existing_hash and not verify_password(password, existing_hash):
+        return jsonify({"error": "Account already exists. Use your correct password to sign in."}), 401
+
     accounts[e_hash] = {
         "user_id": user_id,
-        "name": name,
+        "name": name or (existing.get("name") or ""),
+        "password_hash": existing_hash or hash_password(password),
+        "accountability_target": accountability_target or (existing.get("accountability_target") or "").strip(),
         "created_at": created_at,
         "updated_at": utc_now_iso(),
     }
     save_accounts(accounts)
 
     user_state = load_user_state(user_id)
+    prior_profile = user_state.get("profile") or {}
     user_state["profile"] = {
-        "name": name,
+        "name": name or (prior_profile.get("name") or ""),
         "email_hash": e_hash,
         "registered_at": created_at,
+        "accountability_target": accountability_target or (prior_profile.get("accountability_target") or "").strip(),
     }
     save_user_state(user_id, user_state)
 
-    session_token = create_session_for_user(user_id)
-    response = jsonify({"status": "ok", "user_id": user_id, "name": name})
-    response.set_cookie(
-        "ai_session",
-        session_token,
-        max_age=SESSION_TTL_SECONDS,
-        httponly=True,
-        samesite="Lax",
-        secure=COOKIE_SECURE,
-        path="/",
-    )
+    access_token, refresh_token = create_auth_tokens_for_user(user_id)
+    response = jsonify({"status": "ok", "user_id": user_id, "name": user_state["profile"].get("name") or ""})
+    set_auth_cookies(response, access_token, refresh_token)
+    clear_legacy_session_cookie(response)
+    return response
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def api_auth_login():
+    mark_user_activity()
+    if reject_large_request(8192):
+        return jsonify({"error": "Payload too large."}), 413
+    if is_rate_limited("login", max_hits=12, window_seconds=600):
+        return jsonify({"error": "Too many attempts. Try again later."}), 429
+
+    data = request.get_json(silent=True) or {}
+    email = sanitize_email(data.get("email"))
+    password = data.get("password") or ""
+    if not is_valid_email(email) or not password:
+        return jsonify({"error": "Valid email and password are required."}), 400
+
+    e_hash = email_hash(email)
+    accounts = load_accounts()
+    account = accounts.get(e_hash) or {}
+    password_hash = account.get("password_hash") or ""
+    if not password_hash or not verify_password(password, password_hash):
+        return jsonify({"error": "Invalid credentials."}), 401
+
+    user_id = sanitize_user_id(account.get("user_id") or derive_user_id_from_email(email))
+    access_token, refresh_token = create_auth_tokens_for_user(user_id)
+    response = jsonify({"status": "ok", "user_id": user_id, "name": account.get("name") or ""})
+    set_auth_cookies(response, access_token, refresh_token)
+    clear_legacy_session_cookie(response)
+    return response
+
+
+@app.route("/api/auth/refresh", methods=["POST"])
+def api_auth_refresh():
+    if reject_large_request(4096):
+        return jsonify({"error": "Payload too large."}), 413
+
+    access_token, refresh_token = refresh_tokens_from_refresh_cookie()
+    if not access_token or not refresh_token:
+        response = jsonify({"error": "Refresh token expired or invalid."})
+        clear_session_cookie(response)
+        return response, 401
+
+    response = jsonify({"status": "ok"})
+    set_auth_cookies(response, access_token, refresh_token)
     return response
 
 
@@ -7733,6 +9433,7 @@ def api_auth_me():
         "authenticated": True,
         "user_id": user_id,
         "name": profile.get("name") or "",
+        "accountability_target": profile.get("accountability_target") or "",
         "daily_finance_alert": daily_alert,
     })
 
@@ -7741,13 +9442,9 @@ def api_auth_me():
 def api_auth_logout():
     if reject_large_request(4096):
         return jsonify({"error": "Payload too large."}), 413
-    raw_token = request.cookies.get("ai_session") or ""
-    if raw_token:
-        sessions = cleanup_expired_sessions()
-        token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
-        if token_hash in sessions:
-            del sessions[token_hash]
-            save_sessions(sessions)
+    revoke_token_cookie("ai_access", "access")
+    revoke_token_cookie("ai_refresh", "refresh")
+    revoke_token_cookie("ai_session", "access")
     response = jsonify({"status": "logged_out"})
     clear_session_cookie(response)
     return response
@@ -7791,6 +9488,8 @@ def api_finance_quotes():
     rows = []
     for symbol in symbols:
         quote = quotes_map.get(symbol) or {}
+        as_of_label = quote_as_of_label(quote)
+        freshness = quote_freshness_label(quote)
         rows.append({
             "symbol": symbol,
             "name": quote.get("name") or symbol,
@@ -7802,6 +9501,9 @@ def api_finance_quotes():
             "market_time_utc": format_quote_timestamp(quote.get("market_time")),
             "provider": quote.get("provider") or "unknown",
             "stale": bool(quote.get("stale")),
+            "from_cache": bool(quote.get("from_cache")),
+            "data_freshness": freshness,
+            "as_of_label": f"as of {as_of_label}",
             "cache_age_seconds": quote.get("cache_age_seconds"),
             "last_known_utc": quote.get("last_known_utc") or "",
         })
@@ -7847,6 +9549,9 @@ def api_finance_watchlist():
                     "market_time_utc": format_quote_timestamp((quotes_map.get(symbol) or {}).get("market_time")),
                     "provider": (quotes_map.get(symbol) or {}).get("provider") or "unknown",
                     "stale": bool((quotes_map.get(symbol) or {}).get("stale")),
+                    "from_cache": bool((quotes_map.get(symbol) or {}).get("from_cache")),
+                    "data_freshness": quote_freshness_label(quotes_map.get(symbol) or {}),
+                    "as_of_label": f"as of {quote_as_of_label(quotes_map.get(symbol) or {})}",
                     "cache_age_seconds": (quotes_map.get(symbol) or {}).get("cache_age_seconds"),
                     "last_known_utc": (quotes_map.get(symbol) or {}).get("last_known_utc") or "",
                 }
@@ -8011,6 +9716,89 @@ def api_finance_runway_buffer():
         "runway_buffer": metrics,
         "saved_profile": finance_profile.get("runway_buffer_profile") or {},
     })
+
+
+@app.route("/api/finance/hysa-auto-sweep", methods=["GET", "POST"])
+def api_finance_hysa_auto_sweep():
+    """Manage explicit user consent for automatic HYSA idle-cash sweep."""
+    mark_user_activity()
+    data = request.get_json(silent=True) or {} if request.method == "POST" else {}
+    session_user_id = resolve_session_user_id()
+    user_id = sanitize_user_id(session_user_id or request.args.get("user_id") or data.get("user_id") or DEFAULT_USER_ID)
+    user_state = ensure_finance_profiles(load_user_state(user_id))
+    finance_profile = user_state.get("finance_profile") or {}
+    cash_profile = finance_profile.get("cash_management") or {}
+
+    if request.method == "GET":
+        return jsonify({
+            "user_id": user_id,
+            "hysa_auto_sweep_enabled": bool(cash_profile.get("hysa_auto_sweep_enabled", False)),
+            "hysa_auto_sweep_enabled_at": str(cash_profile.get("hysa_auto_sweep_enabled_at") or ""),
+            "as_of_utc": utc_now_iso(),
+        })
+
+    if reject_large_request(4096):
+        return jsonify({"error": "Payload too large."}), 413
+    enabled = parse_bool(data.get("enabled"), default=False)
+
+    cash_profile["hysa_auto_sweep_enabled"] = bool(enabled)
+    consent_history = cash_profile.get("hysa_auto_sweep_consent_history")
+    if not isinstance(consent_history, list):
+        consent_history = []
+    change_ts = utc_now_iso()
+    consent_history.append({
+        "enabled": bool(enabled),
+        "changed_at": change_ts,
+    })
+    cash_profile["hysa_auto_sweep_consent_history"] = consent_history[-100:]
+    if enabled:
+        cash_profile["hysa_auto_sweep_enabled_at"] = change_ts
+    else:
+        cash_profile["hysa_auto_sweep_enabled_at"] = ""
+    finance_profile["cash_management"] = cash_profile
+    user_state["finance_profile"] = finance_profile
+    save_user_state(user_id, user_state)
+
+    return jsonify({
+        "status": "ok",
+        "user_id": user_id,
+        "hysa_auto_sweep_enabled": bool(cash_profile.get("hysa_auto_sweep_enabled", False)),
+        "hysa_auto_sweep_enabled_at": str(cash_profile.get("hysa_auto_sweep_enabled_at") or ""),
+        "hysa_auto_sweep_consent_history": cash_profile.get("hysa_auto_sweep_consent_history") or [],
+        "as_of_utc": utc_now_iso(),
+    })
+
+
+@app.route("/api/finance/activity-log", methods=["GET"])
+def api_finance_activity_log():
+    """Return user-visible audit history for trust and transparency."""
+    mark_user_activity()
+    session_user_id = resolve_session_user_id()
+    user_id = sanitize_user_id(session_user_id or request.args.get("user_id") or DEFAULT_USER_ID)
+    limit = int(to_float_or_none(request.args.get("limit")) or 100)
+
+    sql_activity = analytics_sql_fetch_user_activity_log(user_id, limit=limit)
+    user_state = ensure_finance_profiles(load_user_state(user_id))
+    cash_profile = (user_state.get("finance_profile") or {}).get("cash_management") or {}
+    sweep_history = cash_profile.get("hysa_auto_sweep_consent_history")
+    if not isinstance(sweep_history, list):
+        sweep_history = []
+
+    # Backfill one baseline consent entry from legacy field when history is absent.
+    if not sweep_history:
+        enabled_at = str(cash_profile.get("hysa_auto_sweep_enabled_at") or "")
+        if enabled_at:
+            sweep_history.append({"enabled": True, "changed_at": enabled_at})
+
+    return jsonify(
+        {
+            "user_id": user_id,
+            "as_of_utc": utc_now_iso(),
+            "override_history": sql_activity.get("overrides") or [],
+            "sweep_consent_history": sweep_history[-200:][::-1],
+            "sent_cancellations": sql_activity.get("cancellations") or [],
+        }
+    )
 
 
 @app.route("/api/finance/opportunity-cost", methods=["GET", "POST"])
@@ -8220,8 +10008,8 @@ def api_finance_subscription_cancel_draft():
         return jsonify({"error": "name is required."}), 400
 
     user_state = ensure_finance_profiles(load_user_state(user_id))
-    subscription_profile = user_state.get("subscription_profile") or {}
     user_state, alerts = detect_subscription_vampires(user_state)
+    subscription_profile = user_state.get("subscription_profile") or {}
     match = None
     for alert in alerts:
         if normalize_case(alert.get("service_name")) == normalize_case(target_name):
@@ -8236,11 +10024,88 @@ def api_finance_subscription_cancel_draft():
         return jsonify({"error": "Subscription not found."}), 404
 
     draft = build_subscription_cancellation_email(match.get("service_name") or target_name, match.get("monthly_cost") or 0.0)
+    review_token = secrets.token_urlsafe(24)
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+    subscription_profile["pending_cancellation_review"] = {
+        "service_name": match.get("service_name") or target_name,
+        "review_token": review_token,
+        "created_at": utc_now_iso(),
+        "expires_at": expires_at,
+        "draft": draft,
+    }
+    user_state["subscription_profile"] = subscription_profile
     save_user_state(user_id, user_state)
     return jsonify({
         "status": "ok",
         "user_id": user_id,
         "service_name": match.get("service_name") or target_name,
+        "draft": draft,
+        "auto_sent": False,
+        "review_required": True,
+        "review_token": review_token,
+        "review_expires_at": expires_at,
+        "confirmation_text_required": "I HAVE REVIEWED AND CONFIRM SEND",
+        "next_step": "Call /api/finance/subscriptions/cancel-send with review_token and confirmation text.",
+    })
+
+
+@app.route("/api/finance/subscriptions/cancel-send", methods=["POST"])
+def api_finance_subscription_cancel_send():
+    """Require explicit review+confirm before submitting a cancellation draft."""
+    mark_user_activity()
+    if reject_large_request(8192):
+        return jsonify({"error": "Payload too large."}), 413
+
+    session_user_id = resolve_session_user_id()
+    data = request.get_json(silent=True) or {}
+    user_id = sanitize_user_id(session_user_id or data.get("user_id") or DEFAULT_USER_ID)
+    target_name = (data.get("name") or "").strip()
+    review_token = (data.get("review_token") or "").strip()
+    confirmation_text = (data.get("confirmation_text") or "").strip()
+    confirm_send = bool(data.get("confirm_send") is True)
+
+    if not target_name:
+        return jsonify({"error": "name is required."}), 400
+    if not review_token:
+        return jsonify({"error": "review_token is required."}), 400
+    if not confirm_send:
+        return jsonify({"error": "confirm_send=true is required to submit cancellation."}), 400
+    if confirmation_text != "I HAVE REVIEWED AND CONFIRM SEND":
+        return jsonify({"error": "Exact confirmation text is required before submission."}), 400
+
+    user_state = ensure_finance_profiles(load_user_state(user_id))
+    subscription_profile = user_state.get("subscription_profile") or {}
+    pending = subscription_profile.get("pending_cancellation_review") or {}
+    pending_name = (pending.get("service_name") or "").strip()
+    pending_token = (pending.get("review_token") or "").strip()
+    pending_expires = parse_iso_datetime(pending.get("expires_at") or "")
+
+    if not pending_name or not pending_token:
+        return jsonify({"error": "No pending reviewed draft found. Request a new draft first."}), 409
+    if normalize_case(pending_name) != normalize_case(target_name):
+        return jsonify({"error": "Pending draft merchant does not match requested name."}), 409
+    if pending_token != review_token:
+        return jsonify({"error": "Invalid review_token."}), 401
+    if pending_expires is None or datetime.now(timezone.utc) >= pending_expires:
+        return jsonify({"error": "Review token expired. Request a new draft."}), 409
+
+    draft = pending.get("draft") if isinstance(pending.get("draft"), dict) else {}
+    if not draft.get("subject") or not draft.get("body"):
+        return jsonify({"error": "Pending draft is invalid. Request a new draft."}), 409
+
+    confirmation_ts = utc_now_iso()
+    analytics_sql_insert_cancellation_send(user_id, target_name, draft, confirmation_ts=confirmation_ts)
+    subscription_profile["pending_cancellation_review"] = {}
+    user_state["subscription_profile"] = subscription_profile
+    save_user_state(user_id, user_state)
+
+    return jsonify({
+        "status": "submitted",
+        "user_id": user_id,
+        "service_name": target_name,
+        "auto_sent": False,
+        "submitted_on_user_behalf": True,
+        "confirmation_ts": confirmation_ts,
         "draft": draft,
     })
 
@@ -8489,6 +10354,7 @@ def chat_background():
 if __name__ == "__main__":
     import sys
     start_idle_learning_worker_once()
+    start_upload_cleanup_worker_once()
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "5004"))
     debug_mode = os.getenv("FLASK_DEBUG", "0") in {"1", "true", "True"}
