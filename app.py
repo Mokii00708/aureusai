@@ -208,6 +208,19 @@ finance_provider_health = {
         "error_count": 0,
         "skip_count": 0,
     },
+    "twelvedata": {
+        "last_attempt": "",
+        "last_success": "",
+        "last_error": "",
+        "last_error_type": "",
+        "last_error_http_status": 0,
+        "cooldown_until": "",
+        "cooldown_reason": "",
+        "last_skip": "",
+        "success_count": 0,
+        "error_count": 0,
+        "skip_count": 0,
+    },
     "alpha_vantage": {
         "last_attempt": "",
         "last_success": "",
@@ -231,6 +244,7 @@ FX_RATE_CACHE_TTL_SECONDS = int(os.getenv("FX_RATE_CACHE_TTL_SECONDS", "3600"))
 OPPORTUNITY_COST_THRESHOLD_USD = float(os.getenv("OPPORTUNITY_COST_THRESHOLD_USD", "100"))
 OPPORTUNITY_COST_DEFAULT_YEARS = int(os.getenv("OPPORTUNITY_COST_DEFAULT_YEARS", "10"))
 OPPORTUNITY_COST_DEFAULT_ANNUAL_RETURN = float(os.getenv("OPPORTUNITY_COST_DEFAULT_ANNUAL_RETURN", "0.07"))
+TWELVEDATA_API_KEY = (os.getenv("TWELVEDATA_API_KEY") or "demo").strip()
 ALPHA_VANTAGE_API_KEY = (os.getenv("ALPHA_VANTAGE_API_KEY") or "").strip()
 HOME_COUNTRY = (os.getenv("HOME_COUNTRY") or "United States").strip()
 
@@ -4441,6 +4455,62 @@ def fetch_alpha_vantage_quotes(symbols):
     return quotes, (source_urls[0] if source_urls else "")
 
 
+def fetch_twelvedata_quotes(symbols):
+    """Tertiary provider: TwelveData real-time price endpoint."""
+    if not symbols:
+        return {}, ""
+
+    api_key = TWELVEDATA_API_KEY or "demo"
+    quotes = {}
+    source_urls = []
+    for symbol in symbols:
+        normalized = normalize_ticker_symbol(symbol)
+        if not normalized:
+            continue
+        price_url = f"https://api.twelvedata.com/price?symbol={quote_plus(normalized)}&apikey={quote_plus(api_key)}"
+        quote_url = f"https://api.twelvedata.com/quote?symbol={quote_plus(normalized)}&apikey={quote_plus(api_key)}"
+        try:
+            payload = fetch_json_url(price_url)
+            source_urls.append(price_url)
+            price = to_float_or_none(payload.get("price"))
+            if price is None:
+                continue
+
+            change_percent = None
+            market_time = None
+            try:
+                quote_payload = fetch_json_url(quote_url)
+                source_urls.append(quote_url)
+                change_percent = to_float_or_none(quote_payload.get("percent_change"))
+                datetime_raw = (quote_payload.get("datetime") or "").strip()
+                if datetime_raw:
+                    dt = datetime.strptime(datetime_raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                    market_time = int(dt.timestamp())
+            except Exception:
+                pass
+
+            quotes[normalized] = {
+                "symbol": normalized,
+                "name": normalized,
+                "price": price,
+                "currency": "USD",
+                "exchange": "TWELVEDATA",
+                "change_percent": change_percent,
+                "market_time": market_time,
+                "beta": None,
+                "market_cap": None,
+                "provider": "twelvedata",
+                "source_url": price_url,
+                "price_source_field": "price",
+                "change_percent_source_field": "quote.percent_change",
+                "market_time_source_field": "quote.datetime",
+            }
+        except Exception:
+            continue
+
+    return quotes, (" | ".join(source_urls[:2]) if source_urls else "")
+
+
 def fetch_live_quotes(symbols):
     """Fetch live or most-recent stock quotes with provider fallback chain."""
     requested = []
@@ -4509,7 +4579,27 @@ def fetch_live_quotes(symbols):
                     mark_quote_provider_error("stooq", e)
         remaining = [s for s in remaining if s not in quotes]
 
-        # Provider 3: Alpha Vantage fallback (optional API key)
+        # Provider 3: TwelveData fallback (demo key supported)
+        if remaining:
+            td_blocked, td_left, td_reason = get_provider_cooldown_state("twelvedata")
+            if td_blocked:
+                mark_quote_provider_skipped("twelvedata", f"cooldown:{td_left}s:{td_reason}")
+            else:
+                mark_quote_provider_attempt("twelvedata")
+                try:
+                    td_quotes, td_source = fetch_twelvedata_quotes(remaining)
+                    if td_source:
+                        used_sources.append(td_source)
+                    for symbol, quote in td_quotes.items():
+                        if symbol not in quotes:
+                            quotes[symbol] = quote
+                    if td_quotes:
+                        mark_quote_provider_success("twelvedata")
+                except Exception as e:
+                    mark_quote_provider_error("twelvedata", e)
+        remaining = [s for s in remaining if s not in quotes]
+
+        # Provider 4: Alpha Vantage fallback (optional API key)
         if remaining:
             if not ALPHA_VANTAGE_API_KEY:
                 mark_quote_provider_skipped("alpha_vantage", "disabled:no-api-key")
@@ -6341,6 +6431,20 @@ def get_personal_finance_feature_reply(user_message, user_state, user_id=DEFAULT
     """Handle watchlist/subscription commands before generic model responses."""
     user_state = ensure_finance_profiles(user_state)
     normalized = normalize_intent_text(user_message)
+
+    if (
+        "investment advice" in normalized
+        and any(token in normalized for token in ["allowed", "not allowed", "can", "cannot", "cant", "can't"])
+    ):
+        policy_text = (
+            "Here is what I can and cannot do on investment advice:\n"
+            "- Allowed: explain concepts, compare risk levels, walk through diversification ideas, and help you build a decision checklist based on your goals/time horizon/risk tolerance.\n"
+            "- Allowed: show traceable market data when provider data is available, and clearly label assumptions in hypothetical examples.\n"
+            "- Not allowed: guarantee returns, claim a sure-win trade, or present unverified numbers as facts.\n"
+            "- Not allowed: pressure you into urgent all-in moves or hide uncertainty/sources.\n"
+            "- Important: this is informational support, not licensed financial advice."
+        )
+        return with_citations(policy_text, ["https://www.investor.gov/introduction-investing"], include_sources), False
 
     if is_direct_investment_allocation_query(normalized):
         return build_investment_allocation_baseline_reply(include_sources=include_sources), False
