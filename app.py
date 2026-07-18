@@ -4228,8 +4228,12 @@ def fetch_yahoo_quotes(symbols):
         return {}, ""
     joined = ",".join(symbols)
     source_url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={quote_plus(joined)}"
-    payload = fetch_json_url(source_url)
-    fetched = ((payload.get("quoteResponse") or {}).get("result") or [])
+    fetched = []
+    try:
+        payload = fetch_json_url(source_url)
+        fetched = ((payload.get("quoteResponse") or {}).get("result") or [])
+    except Exception:
+        fetched = []
 
     quotes = {}
     for item in fetched:
@@ -4257,7 +4261,69 @@ def fetch_yahoo_quotes(symbols):
             "change_percent_source_field": "regularMarketChangePercent",
             "market_time_source_field": "regularMarketTime",
         }
+
+    # Yahoo quote endpoint can intermittently fail per-IP. Fall back to chart endpoint.
+    missing = [s for s in symbols if normalize_ticker_symbol(s) not in quotes]
+    if missing:
+        chart_quotes, chart_source = fetch_yahoo_chart_quotes(missing)
+        for symbol, quote in chart_quotes.items():
+            if symbol not in quotes:
+                quotes[symbol] = quote
+        if chart_source:
+            source_url = f"{source_url} | {chart_source}"
+
     return quotes, source_url
+
+
+def fetch_yahoo_chart_quotes(symbols):
+    """Fallback Yahoo provider using chart API for regular market price/time."""
+    if not symbols:
+        return {}, ""
+
+    quotes = {}
+    source_urls = []
+    for raw in symbols:
+        symbol = normalize_ticker_symbol(raw)
+        if not symbol:
+            continue
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{quote_plus(symbol)}?interval=1d&range=1d"
+        try:
+            payload = fetch_json_url(url)
+            result = ((payload.get("chart") or {}).get("result") or [])
+            if not result:
+                continue
+            meta = (result[0] or {}).get("meta") or {}
+            market_price = to_float_or_none(meta.get("regularMarketPrice"))
+            market_time = to_int_or_none(meta.get("regularMarketTime"))
+            if market_price is None:
+                continue
+
+            prev_close = to_float_or_none(meta.get("previousClose"))
+            change_percent = None
+            if prev_close and prev_close > 0:
+                change_percent = ((market_price - prev_close) / prev_close) * 100.0
+
+            quotes[symbol] = {
+                "symbol": symbol,
+                "name": meta.get("longName") or meta.get("shortName") or symbol,
+                "price": market_price,
+                "currency": meta.get("currency") or "USD",
+                "exchange": meta.get("fullExchangeName") or meta.get("exchangeName") or "",
+                "change_percent": change_percent,
+                "market_time": market_time,
+                "beta": None,
+                "market_cap": None,
+                "provider": "yahoo_chart",
+                "source_url": url,
+                "price_source_field": "chart.result[0].meta.regularMarketPrice",
+                "change_percent_source_field": "chart.result[0].meta.previousClose+regularMarketPrice",
+                "market_time_source_field": "chart.result[0].meta.regularMarketTime",
+            }
+            source_urls.append(url)
+        except Exception:
+            continue
+
+    return quotes, (" | ".join(source_urls) if source_urls else "")
 
 
 def symbol_to_stooq(symbol):
