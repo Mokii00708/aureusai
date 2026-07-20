@@ -63,6 +63,7 @@ DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "5"))
 DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "10"))
 DB_POOL_RECYCLE_SECONDS = int(os.getenv("DB_POOL_RECYCLE_SECONDS", "1800"))
 LLM_REQUEST_TIMEOUT_SECONDS = float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "25"))
+OPENAI_CHAT_MODEL = (os.getenv("OPENAI_CHAT_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini"
 DATA_UNAVAILABLE_RETRY_MESSAGE = "Data unavailable right now. Please try again in a moment."
 MARKET_DATA_UNAVAILABLE_RETRY_MESSAGE = "Market data unavailable right now. Please try again in a moment."
 UNVERIFIED_FINANCIAL_CLAIM_MESSAGE = (
@@ -2352,6 +2353,7 @@ def get_ai_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True
             conversation_history.append({"role": "user", "content": user_message})
             conversation_history.append({"role": "assistant", "content": gate_message})
             conversation_history = trim_history(conversation_history)
+            user_state = update_autonomous_learning(user_state, user_message, gate_message)
             user_state["history"] = conversation_history
         save_user_state(user_id, user_state)
         return gate_message
@@ -2408,7 +2410,7 @@ def get_ai_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True
         # Stream response from API
         full_response = ""
         with frontier_client.chat.completions.create(
-            model="gpt-4",
+            model=OPENAI_CHAT_MODEL,
             messages=conversation_history,
             temperature=0.7,
             max_tokens=800,
@@ -2579,7 +2581,7 @@ def get_ai_response_sync(user_message, user_id=DEFAULT_USER_ID, remember_history
         conversation_history = trim_history(conversation_history)
 
         response = frontier_client.chat.completions.create(
-            model="gpt-4",
+            model=OPENAI_CHAT_MODEL,
             messages=conversation_history,
             temperature=0.7,
             max_tokens=800,
@@ -3869,7 +3871,7 @@ def parse_purchase_psychology(user_message):
     )
     try:
         response = frontier_client.chat.completions.create(
-            model="gpt-4",
+            model=OPENAI_CHAT_MODEL,
             messages=[
                 {"role": "system", "content": instruction},
                 {"role": "user", "content": raw[:280]},
