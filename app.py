@@ -3271,7 +3271,7 @@ def get_comparison_data(firms, request_trace_id=""):
         return {}, blocked
 
     symbols = [entry["symbol"] for entry in entries]
-    quotes, source_url = fetch_yahoo_quotes(symbols)
+    quotes, source_url = fetch_live_quotes(symbols)
     result = {}
     for entry in entries:
         symbol = entry["symbol"]
