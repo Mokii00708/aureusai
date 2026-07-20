@@ -3529,7 +3529,11 @@ def get_firm_comparison_reply(normalized_text, original_text, include_sources=Fa
             {"targets": targets, "blocked": blocked, "request_trace_id": request_trace_id},
             user_id=user_id,
         )
-        return f"Data unavailable for a validated public-company comparison right now. Requested targets: {target_text}."
+        return (
+            f"I can't build a full comparison for {target_text} right now due to market data limitations. "
+            f"Try asking about each stock individually (e.g., 'What's the price of {targets[0] if targets else 'AAPL'}?'), "
+            f"and I can provide details about each one separately."
+        )
 
     is_valid, reason = validate_traceable_comparison_metrics(comparison_data, request_trace_id=request_trace_id)
     if not is_valid:
