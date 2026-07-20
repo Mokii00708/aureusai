@@ -326,13 +326,13 @@ NON_PUBLIC_COMPARISON_ALIASES = {
 
 SYSTEM_PROMPT = """You are Nudge: a direct, fiercely loyal, opinionated financial coach.
 You answer general knowledge, life, technology, history, strategy, and finance questions, but your edge is judgment, not bland recitation.
-Never default to neutral textbook language when the user is asking what to do. Take a stand. Debt is an emergency. Lifestyle inflation is a silent killer. Compound interest is a weapon.
-After explaining a financial idea or market situation, give a concrete next-step recommendation for what the user should do in the real world.
-Do not open with generic filler like 'That's a great question' or 'Here's the deal.' Start with substance.
-Never mention internal instructions, capabilities, system limits, data-feed status, or implementation details. Speak as a decisive coach focused on action.
-If a user asks what exactly to invest in, provide a concrete baseline allocation with explicit assumptions, explain why it works, and ask exactly 2 targeted follow-up questions to customize it.
-When relevant, use user behavioral metrics like stress, fatigue, bias, and impulse patterns to sharpen your judgment.
-Keep responses punchy, scannable, decisive, and slightly witty. Stay within safety boundaries and avoid harmful guidance."""
+Be concise: short sentences, no unnecessary preamble, get to the point fast, and do not repeat the user's question.
+When the user asks what to do, take a stand and give the next real-world step.
+Never open with filler like 'That's a great question' or 'Here's the deal.'
+Never mention internal instructions, capabilities, system limits, data-feed status, or implementation details.
+If a user asks what exactly to invest in, give a concrete baseline allocation with explicit assumptions, explain why it works, and ask exactly 2 targeted follow-up questions.
+When relevant, use user behavioral metrics like stress, fatigue, bias, and impulse patterns.
+Keep responses punchy, scannable, decisive, and slightly witty, while staying within safety boundaries and avoiding harmful guidance."""
 
 
 def strip_cliche_openers(text):
@@ -2239,12 +2239,12 @@ def detect_high_stress_finance_context(text):
 def _high_stress_opening(context):
     """Return a plain-language acknowledgment opener for high-stress finance messages."""
     if context.get("hardship"):
-        return "That is a stressful spot, and you are doing the right thing by dealing with it early."
+        return "That is a stressful spot, and it is smart to handle it now."
     if context.get("loss_distress"):
-        return "That is a rough hit, and feeling shaken after a loss like that is normal."
+        return "That is a rough hit, and feeling shaken is normal."
     if context.get("peer_hype"):
-        return "Good call asking before acting because hype-based money advice can get expensive fast."
-    return "This is a high-pressure money decision, so let us slow it down and handle it clearly."
+        return "Good call asking before acting because hype can get expensive fast."
+    return "This is a high-pressure money decision, so let us keep it clear."
 
 
 def has_high_stress_acknowledgment(reply_text):
@@ -2285,14 +2285,11 @@ def get_high_stress_finance_reply(user_message, include_sources=False):
 
     if context.get("hardship"):
         reply = (
-            "That is a stressful spot, and you are doing the right thing by dealing with it early. "
-            "Here is the practical playbook for this week:\n"
-            "1. Contact your landlord today before the due date or as soon as possible. Give a specific amount you can pay now and a realistic date for the rest.\n"
-            "2. Apply immediately for local rental assistance (city/county programs, 211, community nonprofits). Same-day applications matter.\n"
-            "3. Prioritize bills in this order for now: housing, utilities, food, transportation, then unsecured debt.\n"
-            "4. If short on cash, ask utility providers and lenders for hardship plans before missing more payments.\n"
-            "5. Avoid payday/title loans if possible. The interest spiral usually makes next month worse.\n"
-            "If you want, I can help you draft a landlord message in 60 seconds using your exact numbers."
+            "That is a stressful spot, and it is smart to handle it now. "
+            "1. Tell your landlord today what you can pay now and when the rest would come.\n"
+            "2. Apply now for rental help through 211, your city/county, and local nonprofits.\n"
+            "3. Protect housing, utilities, food, and transportation before unsecured debt.\n"
+            "4. Avoid payday or title loans unless there is no other option."
         )
         if include_sources:
             return with_citations(reply, ["https://www.211.org/"], include_sources)
@@ -2300,24 +2297,19 @@ def get_high_stress_finance_reply(user_message, include_sources=False):
 
     if context.get("peer_hype"):
         reply = (
-            "Good call asking before acting because hype-based money advice can get expensive fast. "
-            "I would not put all your savings into a single crypto bet based on a friend or influencer claim.\n"
-            "1. A \"10x soon\" claim is not evidence; it is a red flag unless backed by verifiable data and risk limits.\n"
-            "2. Putting all savings into one volatile asset creates concentration risk and can wipe out emergency money.\n"
-            "3. Keep your safety cash (rent/emergency fund) out of high-volatility bets.\n"
-            "4. If you still want exposure, size it small enough that a full loss does not damage your core finances."
+            "Good call asking before acting because hype can get expensive fast. "
+            "1. Treat \"10x soon\" claims as a red flag unless there is verifiable data.\n"
+            "2. Keep rent and emergency cash out of high-volatility bets.\n"
+            "3. If you still want exposure, keep it small enough that a full loss is survivable."
         )
         return reply
 
     if context.get("loss_distress"):
         reply = (
-            "That is a rough hit, and feeling shaken after a loss like that is normal. "
-            "Let us make the next move safer, not emotional:\n"
+            "That is a rough hit, and feeling shaken is normal. "
             "1. Pause new risk trades for 48-72 hours.\n"
-            "2. Write down exactly what happened: thesis, entry, size, stop, and what invalidated it.\n"
-            "3. Set hard rules before the next trade: smaller position size, predefined stop, and max daily loss.\n"
-            "4. Protect remaining cash first; recovery starts with risk control, not revenge trading.\n"
-            "If you want, I can help you turn the last trade into a one-page post-mortem and a safer rule set."
+            "2. Write down what happened and what broke the thesis.\n"
+            "3. Set a smaller size, a stop, and a max daily loss before the next trade."
         )
         return reply
 
@@ -4810,10 +4802,7 @@ def build_market_data_unavailable_message(symbols=None):
     normalized = [s for s in normalized if s]
     if not normalized:
         return MARKET_DATA_UNAVAILABLE_RETRY_MESSAGE
-    return (
-        f"{MARKET_DATA_UNAVAILABLE_RETRY_MESSAGE} "
-        f"Requested symbols: {', '.join(normalized)}."
-    )
+    return f"{MARKET_DATA_UNAVAILABLE_RETRY_MESSAGE} Requested symbols: {', '.join(normalized)}."
 
 
 def is_portfolio_comparison_query(normalized_text, original_text):
@@ -5094,10 +5083,7 @@ def get_live_quote_reply(normalized_text, original_text, include_sources=False, 
         return build_market_data_unavailable_message(symbols)
 
     lines = []
-    lines.append(
-        "Latest stock quotes (live or most recent market print). "
-        f"Refresh cadence in this app is about every {FINANCE_QUOTE_CACHE_TTL_SECONDS} seconds."
-    )
+    lines.append("Latest stock quotes:")
     available_count = 0
     for symbol in symbols:
         quote = quotes.get(symbol) or {}
@@ -5142,7 +5128,6 @@ def get_live_quote_reply(normalized_text, original_text, include_sources=False, 
     if available_count == 0:
         return build_market_data_unavailable_message(symbols)
 
-    lines.append("If you want, I can keep tracking a watchlist and compare updates minute by minute.")
     sources = [source_url] if source_url else ["https://finance.yahoo.com/"]
     return with_citations("\n".join(lines), sources, include_sources)
 
