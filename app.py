@@ -3200,24 +3200,37 @@ def resolve_public_equity_symbol(raw_name):
     if not candidate:
         candidate = COMPANY_ALIAS_TO_TICKER.get(normalize_case(raw)) or ""
 
+    # Try Yahoo verification first, but fall back to known tickers if Yahoo fails
     if candidate:
-        quote_payload = fetch_json_url(
-            f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={quote_plus(candidate)}"
-        )
-        result = ((quote_payload.get("quoteResponse") or {}).get("result") or [])
-        if result:
-            qtype = (result[0].get("quoteType") or "").upper()
-            if qtype == "EQUITY":
+        try:
+            quote_payload = fetch_json_url(
+                f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={quote_plus(candidate)}"
+            )
+            result = ((quote_payload.get("quoteResponse") or {}).get("result") or [])
+            if result:
+                qtype = (result[0].get("quoteType") or "").upper()
+                if qtype == "EQUITY":
+                    return {"ok": True, "symbol": candidate}
+        except Exception:
+            # Yahoo failed, fall back to known ticker check
+            if candidate in KNOWN_TICKERS:
                 return {"ok": True, "symbol": candidate}
 
-    search_payload = fetch_json_url(
-        f"https://query1.finance.yahoo.com/v1/finance/search?q={quote_plus(raw)}"
-    )
-    for item in (search_payload.get("quotes") or []):
-        qtype = (item.get("quoteType") or "").upper()
-        symbol = normalize_ticker_symbol(item.get("symbol") or "")
-        if symbol and qtype == "EQUITY":
-            return {"ok": True, "symbol": symbol}
+    # Try Yahoo search as fallback, but handle exceptions
+    try:
+        search_payload = fetch_json_url(
+            f"https://query1.finance.yahoo.com/v1/finance/search?q={quote_plus(raw)}"
+        )
+        for item in (search_payload.get("quotes") or []):
+            qtype = (item.get("quoteType") or "").upper()
+            symbol = normalize_ticker_symbol(item.get("symbol") or "")
+            if symbol and qtype == "EQUITY":
+                return {"ok": True, "symbol": symbol}
+    except Exception:
+        # Yahoo search failed, try company aliases
+        alias = COMPANY_ALIAS_TO_TICKER.get(normalize_case(raw))
+        if alias and alias in KNOWN_TICKERS:
+            return {"ok": True, "symbol": alias}
 
     return {"ok": False, "reason": "not-public-equity"}
 
