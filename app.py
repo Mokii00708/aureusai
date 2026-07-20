@@ -4862,6 +4862,463 @@ def fetch_live_quotes(symbols):
     return quotes, source_url
 
 
+CHART_COLOR_PALETTE = [
+    "#d4af37",
+    "#4cc9f0",
+    "#ff6b6b",
+    "#80ed99",
+    "#f4a261",
+    "#c77dff",
+]
+
+
+def html_escape(text):
+    return (
+        str(text or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def is_projection_chart_request(normalized_text):
+    """Reject forecast/projection chart requests explicitly."""
+    text = normalized_text or ""
+    chart_markers = ["chart", "graph", "plot", "performance over time", "projection"]
+    future_markers = [
+        "project", "projection", "forecast", "predict", "future", "expected growth",
+        "next year", "next 5 years", "going forward", "what will", "where will",
+    ]
+    return any(marker in text for marker in chart_markers) and any(marker in text for marker in future_markers)
+
+
+def is_historical_chart_request(normalized_text):
+    """Detect requests for historical charts backed by real data only."""
+    text = normalized_text or ""
+    chart_markers = ["chart", "graph", "plot", "trend", "over time", "history", "historical"]
+    data_markers = ["price", "stock", "portfolio", "watchlist", "spending", "spent", "expense", "performance"]
+    return any(marker in text for marker in chart_markers) and any(marker in text for marker in data_markers)
+
+
+def parse_historical_range_config(user_message):
+    """Map natural-language ranges to provider-friendly chart ranges and intervals."""
+    text = normalize_case(user_message)
+    configs = [
+        (("1d", "1 day", "today"), {"range": "1d", "interval": "5m", "label": "1 day", "days": 1}),
+        (("5d", "5 days", "week"), {"range": "5d", "interval": "30m", "label": "5 days", "days": 5}),
+        (("1mo", "1 month", "30 days"), {"range": "1mo", "interval": "1d", "label": "1 month", "days": 30}),
+        (("3mo", "3 months", "90 days"), {"range": "3mo", "interval": "1d", "label": "3 months", "days": 90}),
+        (("6mo", "6 months", "180 days"), {"range": "6mo", "interval": "1d", "label": "6 months", "days": 180}),
+        (("ytd", "year to date"), {"range": "ytd", "interval": "1d", "label": "year to date", "days": 210}),
+        (("1y", "1 year", "12 months", "365 days"), {"range": "1y", "interval": "1d", "label": "1 year", "days": 365}),
+        (("2y", "2 years"), {"range": "2y", "interval": "1wk", "label": "2 years", "days": 730}),
+        (("5y", "5 years"), {"range": "5y", "interval": "1mo", "label": "5 years", "days": 1825}),
+        (("max", "all time", "maximum"), {"range": "max", "interval": "1mo", "label": "max", "days": 3650}),
+    ]
+    for markers, config in configs:
+        if any(marker in text for marker in markers):
+            return dict(config)
+    return {"range": "6mo", "interval": "1d", "label": "6 months", "days": 180}
+
+
+def expected_range_start(days_back):
+    return datetime.now(timezone.utc) - timedelta(days=max(1, int(days_back or 1)))
+
+
+def fetch_price_history(symbol, range_config):
+    """Fetch real historical prices from Yahoo Finance chart API without interpolation."""
+    normalized = normalize_ticker_symbol(symbol)
+    if not normalized:
+        return {"symbol": symbol, "points": [], "error": "invalid symbol"}
+
+    chart_url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{quote_plus(normalized)}"
+        f"?range={quote_plus(range_config['range'])}&interval={quote_plus(range_config['interval'])}&includeAdjustedClose=true"
+    )
+    try:
+        payload = fetch_json_url(chart_url)
+        result = ((payload.get("chart") or {}).get("result") or [None])[0] or {}
+        meta = result.get("meta") or {}
+        timestamps = result.get("timestamp") or []
+        indicators = result.get("indicators") or {}
+        adjclose_rows = indicators.get("adjclose") or []
+        quote_rows = indicators.get("quote") or []
+        values = []
+        if adjclose_rows and isinstance(adjclose_rows[0], dict):
+            values = adjclose_rows[0].get("adjclose") or []
+        if not values and quote_rows and isinstance(quote_rows[0], dict):
+            values = quote_rows[0].get("close") or []
+
+        points = []
+        for ts, value in zip(timestamps, values):
+            if ts is None or value is None:
+                continue
+            try:
+                dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+                points.append({"ts": int(ts), "date": dt.strftime("%Y-%m-%d"), "value": float(value)})
+            except Exception:
+                continue
+
+        if len(points) < 2:
+            return {
+                "symbol": normalized,
+                "points": [],
+                "provider": "Yahoo Finance chart API",
+                "source": chart_url,
+                "error": "not enough historical data returned",
+            }
+
+        expected_start = expected_range_start(range_config.get("days"))
+        actual_start_dt = datetime.fromtimestamp(points[0]["ts"], tz=timezone.utc)
+        tolerance_days = max(3, int((range_config.get("days") or 30) * 0.08))
+        partial_range = actual_start_dt > (expected_start + timedelta(days=tolerance_days))
+
+        return {
+            "symbol": normalized,
+            "name": meta.get("symbol") or normalized,
+            "currency": meta.get("currency") or "USD",
+            "exchange": meta.get("exchangeName") or "Yahoo Finance",
+            "provider": "Yahoo Finance chart API",
+            "source": chart_url,
+            "points": points,
+            "partial_range": partial_range,
+            "requested_label": range_config.get("label") or "custom range",
+            "actual_start": points[0]["date"],
+            "actual_end": points[-1]["date"],
+        }
+    except Exception as e:
+        return {
+            "symbol": normalized,
+            "points": [],
+            "provider": "Yahoo Finance chart API",
+            "source": chart_url,
+            "error": str(e),
+        }
+
+
+def extract_common_dates(series_list):
+    """Return ordered intersection of dates across every series."""
+    if not series_list:
+        return []
+    common = None
+    for series in series_list:
+        dates = {point["date"] for point in (series.get("points") or [])}
+        common = dates if common is None else (common & dates)
+    return sorted(common or [])
+
+
+def build_svg_line_chart(title, subtitle, series_list, y_label="Value"):
+    """Render a compact multi-series SVG chart."""
+    width = 640
+    height = 360
+    pad_left = 56
+    pad_right = 18
+    pad_top = 44
+    pad_bottom = 44
+    plot_w = width - pad_left - pad_right
+    plot_h = height - pad_top - pad_bottom
+
+    all_values = []
+    for series in series_list:
+        all_values.extend([float(point["value"]) for point in (series.get("points") or []) if point.get("value") is not None])
+    if len(all_values) < 2:
+        return ""
+
+    min_val = min(all_values)
+    max_val = max(all_values)
+    if abs(max_val - min_val) < 1e-9:
+        max_val = min_val + 1.0
+    pad_val = (max_val - min_val) * 0.08
+    y_min = min_val - pad_val
+    y_max = max_val + pad_val
+
+    max_len = max(len(series.get("points") or []) for series in series_list)
+    x_den = max(1, max_len - 1)
+
+    def x_pos(idx):
+        return pad_left + (idx / x_den) * plot_w
+
+    def y_pos(value):
+        return pad_top + (1 - ((float(value) - y_min) / (y_max - y_min))) * plot_h
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="{html_escape(title)}">',
+        '<rect width="100%" height="100%" rx="18" fill="#1d1713"/>',
+        f'<text x="{pad_left}" y="24" fill="#f7f2ea" font-size="18" font-family="Inter, sans-serif">{html_escape(title)}</text>',
+        f'<text x="{pad_left}" y="40" fill="#d9ccb6" font-size="11" font-family="Inter, sans-serif">{html_escape(subtitle)}</text>',
+    ]
+
+    for tick in range(5):
+        frac = tick / 4
+        y = pad_top + frac * plot_h
+        value = y_max - frac * (y_max - y_min)
+        parts.append(f'<line x1="{pad_left}" y1="{y:.1f}" x2="{pad_left + plot_w}" y2="{y:.1f}" stroke="#4a3f36" stroke-width="1" opacity="0.65"/>')
+        parts.append(f'<text x="{pad_left - 8}" y="{y + 4:.1f}" text-anchor="end" fill="#d9ccb6" font-size="10" font-family="Inter, sans-serif">{value:.2f}</text>')
+
+    for series_idx, series in enumerate(series_list):
+        color = CHART_COLOR_PALETTE[series_idx % len(CHART_COLOR_PALETTE)]
+        points = series.get("points") or []
+        if len(points) < 2:
+            continue
+        commands = []
+        for idx, point in enumerate(points):
+            command = "M" if idx == 0 else "L"
+            commands.append(f'{command}{x_pos(idx):.2f},{y_pos(point["value"]):.2f}')
+        parts.append(f'<path d="{" ".join(commands)}" fill="none" stroke="{color}" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>')
+        end_point = points[-1]
+        parts.append(f'<circle cx="{x_pos(len(points)-1):.2f}" cy="{y_pos(end_point["value"]):.2f}" r="3.2" fill="{color}"/>')
+
+    if series_list and series_list[0].get("points"):
+        first_series = series_list[0]["points"]
+        label_positions = [0]
+        if len(first_series) > 2:
+            label_positions.append(len(first_series) // 2)
+        if len(first_series) > 1:
+            label_positions.append(len(first_series) - 1)
+        seen = set()
+        for pos in label_positions:
+            if pos in seen or pos >= len(first_series):
+                continue
+            seen.add(pos)
+            label = first_series[pos].get("date", "")
+            parts.append(f'<text x="{x_pos(pos):.2f}" y="{height - 16}" text-anchor="middle" fill="#d9ccb6" font-size="10" font-family="Inter, sans-serif">{html_escape(label)}</text>')
+
+    legend_x = pad_left
+    legend_y = height - 28
+    for series_idx, series in enumerate(series_list):
+        color = CHART_COLOR_PALETTE[series_idx % len(CHART_COLOR_PALETTE)]
+        item_x = legend_x + (series_idx * 180)
+        label = html_escape(series.get("label") or f"Series {series_idx + 1}")
+        parts.append(f'<line x1="{item_x}" y1="{legend_y}" x2="{item_x + 18}" y2="{legend_y}" stroke="{color}" stroke-width="3"/>')
+        parts.append(f'<text x="{item_x + 24}" y="{legend_y + 4}" fill="#f7f2ea" font-size="11" font-family="Inter, sans-serif">{label}</text>')
+
+    parts.append(f'<text x="18" y="{pad_top + 8}" fill="#d9ccb6" font-size="10" font-family="Inter, sans-serif" transform="rotate(-90 18 {pad_top + 8})">{html_escape(y_label)}</text>')
+    parts.append('</svg>')
+    return "".join(parts)
+
+
+def build_price_history_chart(user_message):
+    """Build a real historical price chart for requested symbols."""
+    range_config = parse_historical_range_config(user_message)
+    symbols = extract_ticker_candidates(user_message)
+    if not symbols:
+        return None
+
+    series = []
+    partial = []
+    missing = []
+    source_urls = []
+    actual_start = None
+    actual_end = None
+    for symbol in symbols[:4]:
+        history = fetch_price_history(symbol, range_config)
+        points = history.get("points") or []
+        if len(points) < 2:
+            missing.append(symbol)
+            continue
+        if history.get("partial_range"):
+            partial.append(symbol)
+        actual_start = history.get("actual_start") if actual_start is None else min(actual_start, history.get("actual_start") or actual_start)
+        actual_end = history.get("actual_end") if actual_end is None else max(actual_end, history.get("actual_end") or actual_end)
+        source_urls.append(history.get("source") or "")
+        series.append({"label": history.get("symbol") or symbol, "points": points})
+
+    if not series:
+        return {
+            "reply": "I could not get real historical price data for that request from Yahoo Finance chart API.",
+            "chart": None,
+        }
+
+    note_parts = []
+    if missing:
+        note_parts.append(f"Historical data was not available for: {', '.join(missing)}.")
+    if partial:
+        note_parts.append(f"Requested range was only partially available for: {', '.join(partial)}. No gaps were filled or estimated.")
+
+    source = "Yahoo Finance chart API"
+    title = f"Historical Price Chart: {', '.join([item['label'] for item in series])}"
+    subtitle = f"Source: {source} | Range requested: {range_config['label']} | Actual data: {actual_start} to {actual_end}"
+    reply = f"Here is the historical price chart using real data from {source}."
+    if note_parts:
+        reply += " " + " ".join(note_parts)
+    return {
+        "reply": reply,
+        "chart": {
+            "title": title,
+            "subtitle": subtitle,
+            "svg": build_svg_line_chart(title, subtitle, series, y_label="Price"),
+            "source": source,
+            "date_range": f"{actual_start} to {actual_end}",
+            "note": " ".join(note_parts),
+            "source_url": " | ".join([url for url in source_urls if url][:2]),
+        },
+    }
+
+
+def build_portfolio_history_chart(user_message):
+    """Build a real historical portfolio performance chart using provider data only."""
+    portfolios = parse_portfolio_definitions(user_message)
+    if not portfolios:
+        return None
+
+    range_config = parse_historical_range_config(user_message)
+    symbols = sorted({ticker for portfolio in portfolios for ticker in (portfolio.get("holdings") or {}).keys()})
+    if not symbols:
+        return None
+
+    histories = {symbol: fetch_price_history(symbol, range_config) for symbol in symbols}
+    unavailable = [symbol for symbol, history in histories.items() if len(history.get("points") or []) < 2 or history.get("partial_range")]
+    if unavailable:
+        return {
+            "reply": "I can only chart portfolio performance from complete real historical data. "
+                     f"This range is not fully available for: {', '.join(unavailable)}. I did not estimate or fill missing values.",
+            "chart": None,
+        }
+
+    common_dates = extract_common_dates(list(histories.values()))
+    if len(common_dates) < 2:
+        return {
+            "reply": "I could not find a clean overlapping real historical range for every portfolio holding, so I did not generate a chart.",
+            "chart": None,
+        }
+
+    price_maps = {
+        symbol: {point["date"]: float(point["value"]) for point in (histories[symbol].get("points") or []) if point.get("value") is not None}
+        for symbol in symbols
+    }
+    series = []
+    for portfolio in portfolios[:3]:
+        holdings = portfolio.get("holdings") or {}
+        baseline = None
+        points = []
+        for date in common_dates:
+            portfolio_value = 0.0
+            for ticker, weight in holdings.items():
+                portfolio_value += float(weight) * price_maps[ticker][date]
+            baseline = portfolio_value if baseline is None else baseline
+            if baseline and baseline > 0:
+                points.append({"date": date, "value": (portfolio_value / baseline) * 100.0})
+        if len(points) >= 2:
+            series.append({"label": portfolio.get("name") or "Portfolio", "points": points})
+
+    if not series:
+        return {
+            "reply": "I could not build a portfolio chart from the available real historical data.",
+            "chart": None,
+        }
+
+    source = "Yahoo Finance chart API"
+    title = "Historical Portfolio Performance"
+    subtitle = f"Source: {source} | Indexed to 100 at start | Actual data: {common_dates[0]} to {common_dates[-1]}"
+    return {
+        "reply": f"Here is the historical portfolio performance chart using real provider data only. Source: {source}.",
+        "chart": {
+            "title": title,
+            "subtitle": subtitle,
+            "svg": build_svg_line_chart(title, subtitle, series, y_label="Indexed Value"),
+            "source": source,
+            "date_range": f"{common_dates[0]} to {common_dates[-1]}",
+            "note": "No missing periods were estimated. The chart uses only overlapping dates returned by the provider.",
+            "source_url": " | ".join([histories[symbol].get("source") or "" for symbol in symbols[:2] if histories[symbol].get("source")]),
+        },
+    }
+
+
+def build_spending_trend_chart(user_state, user_message):
+    """Build a spending trend chart from logged spend events only."""
+    range_config = parse_historical_range_config(user_message)
+    profile = (ensure_finance_profiles(user_state).get("behavior_budget_profile") or {})
+    events = profile.get("spend_events") or []
+    if not events:
+        return {
+            "reply": "I do not have any logged spend events yet, so I cannot build a real spending chart.",
+            "chart": None,
+        }
+
+    cutoff = expected_range_start(range_config.get("days"))
+    daily_totals = {}
+    kept = 0
+    for event in events:
+        ts_raw = event.get("timestamp") or ""
+        try:
+            event_dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if event_dt.tzinfo is None:
+            event_dt = event_dt.replace(tzinfo=timezone.utc)
+        if event_dt < cutoff:
+            continue
+        kept += 1
+        date_key = event_dt.astimezone(timezone.utc).strftime("%Y-%m-%d")
+        daily_totals[date_key] = daily_totals.get(date_key, 0.0) + float(event.get("amount") or 0.0)
+
+    ordered_dates = sorted(daily_totals.keys())
+    if len(ordered_dates) < 2:
+        return {
+            "reply": "I do not have enough logged spending points in that historical range to draw a chart. I only use your real logged spend events and I do not fill missing days.",
+            "chart": None,
+        }
+
+    series = [{
+        "label": "Logged spending",
+        "points": [{"date": date_key, "value": round(float(daily_totals[date_key]), 2)} for date_key in ordered_dates],
+    }]
+    source = "Logged spend events in this app"
+    title = "Historical Spending Trend"
+    subtitle = f"Source: {source} | Actual logged dates: {ordered_dates[0]} to {ordered_dates[-1]}"
+    return {
+        "reply": "Here is your historical spending trend chart from real logged spend events only. Days without logged events were not estimated or filled.",
+        "chart": {
+            "title": title,
+            "subtitle": subtitle,
+            "svg": build_svg_line_chart(title, subtitle, series, y_label="Spend"),
+            "source": source,
+            "date_range": f"{ordered_dates[0]} to {ordered_dates[-1]}",
+            "note": f"{kept} logged spend events included. Missing days were left blank rather than inferred.",
+            "source_url": "",
+        },
+    }
+
+
+def build_historical_chart_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True):
+    """Build a deterministic chart response from real historical data only."""
+    normalized = normalize_intent_text(user_message)
+    has_chart_marker = any(marker in normalized for marker in ["chart", "graph", "plot", "trend", "historical", "history", "over time"])
+    has_ticker_request = bool(extract_ticker_candidates(user_message))
+    if is_projection_chart_request(normalized):
+        return {
+            "reply": "I can show historical data, but I can't reliably predict future performance or generate projection charts.",
+            "chart": None,
+        }
+
+    if not (is_historical_chart_request(normalized) or (has_chart_marker and has_ticker_request)):
+        return None
+
+    user_state = load_user_state(user_id)
+    if any(marker in normalized for marker in ["spending", "spent", "expense"]):
+        response_payload = build_spending_trend_chart(user_state, user_message)
+    elif "portfolio" in normalized:
+        response_payload = build_portfolio_history_chart(user_message)
+    else:
+        response_payload = build_price_history_chart(user_message)
+
+    if not response_payload:
+        return None
+
+    reply = response_payload.get("reply") or ""
+    if remember_history and reply:
+        conversation = user_state.get("history", default_history())
+        conversation.append({"role": "user", "content": user_message})
+        conversation.append({"role": "assistant", "content": reply})
+        conversation = trim_history(conversation)
+        user_state = update_autonomous_learning(user_state, user_message, reply)
+        user_state["history"] = conversation
+        save_user_state(user_id, user_state)
+
+    return response_payload
+
+
 def format_quote_timestamp(market_time):
     """Convert market unix time to readable UTC text."""
     if not market_time:
@@ -9654,6 +10111,44 @@ body {
     color: white;
 }
 
+.message.bot.chart-card {
+    max-width: min(700px, 100%);
+    width: 100%;
+    background: rgba(18, 13, 10, 0.82);
+    border: 1px solid rgba(255,255,255,0.16);
+    padding: 14px;
+}
+
+.chart-wrap {
+    display: grid;
+    gap: 10px;
+}
+
+.chart-meta {
+    display: grid;
+    gap: 4px;
+    font-size: 12px;
+    color: rgba(255,255,255,0.84);
+}
+
+.chart-meta strong {
+    color: #f4e3a4;
+    font-weight: 600;
+}
+
+.chart-svg-shell {
+    width: 100%;
+    overflow-x: auto;
+    border-radius: 16px;
+    background: rgba(0,0,0,0.16);
+}
+
+.chart-svg-shell svg {
+    display: block;
+    width: 100%;
+    height: auto;
+}
+
 .message.bot.typing {
     padding: 10px 14px;
     min-width: 64px;
@@ -9966,6 +10461,36 @@ function addMessage(role, text) {
     chatBody.scrollTop = chatBody.scrollHeight;
 }
 
+function escapeHtml(value) {
+    return String(value || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function addChartMessage(chart) {
+    if (!chart || !chart.svg) return;
+    const div = document.createElement('div');
+    div.className = 'message bot chart-card';
+    const note = chart.note ? `<div><strong>Note:</strong> ${escapeHtml(chart.note)}</div>` : '';
+    const sourceUrl = chart.source_url ? `<div><strong>Source URL:</strong> ${escapeHtml(chart.source_url)}</div>` : '';
+    div.innerHTML = `
+        <div class="chart-wrap">
+            <div class="chart-meta">
+                <div><strong>Source:</strong> ${escapeHtml(chart.source || 'unknown')}</div>
+                <div><strong>Date Range:</strong> ${escapeHtml(chart.date_range || 'unknown')}</div>
+                ${note}
+                ${sourceUrl}
+            </div>
+            <div class="chart-svg-shell">${chart.svg}</div>
+        </div>
+    `;
+    chatBody.appendChild(div);
+    chatBody.scrollTop = chatBody.scrollHeight;
+}
+
 function showTypingIndicator() {
     hideTypingIndicator();
     const div = document.createElement('div');
@@ -10039,6 +10564,9 @@ async function sendMessage() {
             addMessage('bot', data.attachment_analysis_summary);
         }
         addMessage('bot', data.reply || "I'm sorry, I'm not able to help you with that.");
+        if (data.chart) {
+            addChartMessage(data.chart);
+        }
     } catch (error) {
         hideTypingIndicator();
         console.warn('chat send failed', error);
@@ -10349,6 +10877,24 @@ def api_chat():
         if should_use_simple_fallback(user_message):
             return jsonify({"reply": "I'm sorry, I'm not able to help you with that.", "disclaimer": disclaimer, "reason": ""})
 
+        chart_response = build_historical_chart_response(
+            user_message,
+            user_id=user_id,
+            remember_history=remember_history,
+        )
+        if chart_response is not None:
+            reply = chart_response.get("reply") or ""
+            reason = infer_auto_control_reason(reply)
+            return jsonify({
+                "reply": reply,
+                "chart": chart_response.get("chart"),
+                "user_id": user_id,
+                "remember_history": remember_history,
+                "attachment_analysis_summary": "\n\n".join(attachment_summaries[:3]) if attachment_summaries else "",
+                "disclaimer": disclaimer,
+                "reason": reason,
+            })
+
         try:
             reply = get_ai_response_sync(user_message, user_id=user_id, remember_history=remember_history)
         except Exception:
@@ -10356,6 +10902,7 @@ def api_chat():
         reason = infer_auto_control_reason(reply)
         return jsonify({
             "reply": reply,
+            "chart": None,
             "user_id": user_id,
             "remember_history": remember_history,
             "attachment_analysis_summary": "\n\n".join(attachment_summaries[:3]) if attachment_summaries else "",
@@ -10366,6 +10913,7 @@ def api_chat():
         print(f"Warning: api_chat unexpected error: {e}")
         return jsonify({
             "reply": generic_chat_reply,
+            "chart": None,
             "user_id": user_id,
             "remember_history": remember_history,
             "attachment_analysis_summary": "\n\n".join(attachment_summaries[:3]) if attachment_summaries else "",
