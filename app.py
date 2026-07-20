@@ -3365,15 +3365,19 @@ def build_price_comparison_table(quotes_by_symbol):
         
         if price is None:
             status_text = "price unavailable"
-        elif change is not None and change > 0:
-            status_text = "📈 up"
-        elif change is not None and change < 0:
-            status_text = "📉 down"
+            price_str = "—"
+            change_str = "—"
         else:
-            status_text = "→ flat"
+            if change is not None and change > 0.1:
+                status_text = "📈 up"
+            elif change is not None and change < -0.1:
+                status_text = "📉 down"
+            else:
+                status_text = "→ flat"
+            
+            price_str = f"${price:.2f}"
+            change_str = f"{change:+.2f}%" if change is not None else "—"
         
-        price_str = f"${price:.2f}" if price else "—"
-        change_str = f"{change:+.2f}%" if change is not None else "—"
         rows.append(f"| {symbol} | {price_str} | {change_str} | {status_text} |")
     
     return "\n".join(rows)
@@ -3485,15 +3489,31 @@ def get_firm_comparison_reply(normalized_text, original_text, include_sources=Fa
                 if symbol:
                     symbols.append(symbol)
         
-        if len(symbols) >= 2:
+        if symbols:
             quotes, source_url = fetch_live_quotes(symbols)
-            if len(quotes) >= 2:
-                price_table = build_price_comparison_table(quotes)
+            available_quotes = {s: q for s, q in quotes.items() if q.get("price") is not None}
+            
+            if len(available_quotes) >= 2:
+                price_table = build_price_comparison_table(available_quotes)
                 fallback_reply = (
                     f"Live price snapshot (fundamental metrics currently unavailable):\n\n{price_table}\n\n"
                     "For deeper analysis, you can track these in your watchlist or ask about specific metrics."
                 )
                 return with_citations(fallback_reply, [source_url] if source_url else [], include_sources)
+            elif len(available_quotes) == 1:
+                # Only one stock available - show what we have and offer alternatives
+                stock_symbol = list(available_quotes.keys())[0]
+                stock_quote = available_quotes[stock_symbol]
+                price_str = f"${stock_quote.get('price', '?'):.2f}" if stock_quote.get('price') else "unavailable"
+                unavailable = [s for s in symbols if s not in available_quotes]
+                
+                reply = (
+                    f"I can show {stock_symbol} at {price_str}, but I don't currently have live pricing data "
+                    f"for {', '.join(unavailable)} right now due to provider limitations.\n\n"
+                    f"Try asking about each stock individually (e.g., 'What's {stock_symbol}?', 'Tell me about {unavailable[0] if unavailable else 'the other'}'), "
+                    f"and I can provide more detailed analysis."
+                )
+                return reply
         
         # If even price comparison fails, return the original error message
         target_text = ", ".join(targets)
