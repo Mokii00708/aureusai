@@ -2015,6 +2015,89 @@ def retrieve_learned_answer(user_state, user_message):
     return answer
 
 
+def extract_user_stated_facts(user_text):
+    """Extract simple 'my X is Y' facts from a user message."""
+    text = normalize_case(user_text or "")
+    facts = []
+    patterns = [
+        r"\bmy\s+([a-z0-9][a-z0-9\s\-]{1,40}?)\s+name\s+is\s+([^\n\.!\?]{1,90})",
+        r"\bmy\s+([a-z0-9][a-z0-9\s\-]{1,40}?)\s+is\s+called\s+([^\n\.!\?]{1,90})",
+        r"\bmy\s+([a-z0-9][a-z0-9\s\-]{1,40}?)\s+called\s+([^\n\.!\?]{1,90})",
+        r"\bmy\s+([a-z0-9][a-z0-9\s\-]{1,40}?)\s+is\s+([^\n\.!\?]{1,90})",
+    ]
+    for pattern in patterns:
+        for key, value in re.findall(pattern, text):
+            fact_key = re.sub(r"\s+", " ", key).strip(" -")
+            fact_value = re.sub(r"\s+", " ", value).strip(" -")
+            if len(fact_key) < 2 or len(fact_value) < 2:
+                continue
+            facts.append((fact_key, fact_value))
+    return facts
+
+
+def is_memory_recall_query(normalized_text):
+    """Detect direct requests about earlier user-provided facts."""
+    markers = [
+        "what was my",
+        "what is my",
+        "what was that",
+        "from earlier",
+        "i mentioned earlier",
+        "you remember",
+        "do you remember",
+    ]
+    text = normalized_text or ""
+    return any(marker in text for marker in markers)
+
+
+def recall_user_fact_from_history(user_state, user_message):
+    """Answer direct memory recall prompts by scanning saved user history."""
+    normalized = normalize_intent_text(user_message)
+    if not is_memory_recall_query(normalized):
+        return ""
+
+    history = user_state.get("history") or []
+    if not isinstance(history, list) or not history:
+        return ""
+
+    target = ""
+    target_match = re.search(r"\bwhat\s+(?:was|is)\s+my\s+([a-z0-9\s\-]{2,50})", normalized)
+    if target_match:
+        target = re.sub(r"\s+", " ", target_match.group(1)).strip(" ?.")
+    else:
+        that_match = re.search(r"\bwhat\s+was\s+that\s+([a-z0-9\s\-]{2,50})", normalized)
+        if that_match:
+            target = re.sub(r"\s+", " ", that_match.group(1)).strip(" ?.")
+
+    collected = []
+    for item in history:
+        if (item or {}).get("role") != "user":
+            continue
+        content = (item or {}).get("content") or ""
+        collected.extend(extract_user_stated_facts(content))
+
+    if not collected:
+        return ""
+
+    if not target:
+        key, value = collected[-1]
+        return f"Earlier, you said your {key} was {value}."
+
+    best = None
+    best_score = 0.0
+    for key, value in reversed(collected):
+        score = question_similarity(target, key)
+        if target in key or key in target:
+            score += 0.25
+        if score > best_score:
+            best_score = score
+            best = (key, value)
+
+    if best and best_score >= 0.55:
+        return f"You said your {best[0]} was {best[1]}."
+    return ""
+
+
 def question_similarity(a, b):
     """Hybrid similarity: sequence ratio plus token overlap for paraphrases."""
     seq = difflib.SequenceMatcher(a=a, b=b).ratio()
@@ -2393,6 +2476,21 @@ def get_ai_response(user_message, user_id=DEFAULT_USER_ID, remember_history=True
             save_user_state(user_id, user_state)
         return finance_direct_reply
 
+    memory_recall_reply = recall_user_fact_from_history(user_state, user_message)
+    if memory_recall_reply:
+        memory_recall_reply = apply_tone_style(memory_recall_reply, user_message)
+        memory_recall_reply = merge_witty_alert(memory_recall_reply, subscription_alert)
+        memory_recall_reply = apply_high_stress_tone_check(user_message, memory_recall_reply)
+        if remember_history:
+            conversation_history.append({"role": "user", "content": user_message})
+            conversation_history.append({"role": "assistant", "content": memory_recall_reply})
+            conversation_history = trim_history(conversation_history)
+            user_state = update_autonomous_learning(user_state, user_message, memory_recall_reply)
+            user_state["history"] = conversation_history
+        if remember_history or alert_state_changed or sweep_changed:
+            save_user_state(user_id, user_state)
+        return memory_recall_reply
+
     merged_warning = f"{gate_warning}\n{sweep_notice}" if (gate_warning and sweep_notice) else (gate_warning or sweep_notice)
     adaptive_system = build_adaptive_system_prompt(user_state, user_message, temporary_warning=merged_warning)
     if conversation_history and conversation_history[0].get("role") == "system":
@@ -2539,6 +2637,23 @@ def get_ai_response_sync(user_message, user_id=DEFAULT_USER_ID, remember_history
         if remember_history or finance_changed or alert_state_changed or sweep_changed:
             save_user_state(user_id, user_state)
         return finance_direct_reply
+
+    memory_recall_reply = recall_user_fact_from_history(user_state, user_message)
+    if memory_recall_reply:
+        memory_recall_reply = apply_tone_style(memory_recall_reply, user_message)
+        memory_recall_reply = apply_high_stress_tone_check(user_message, memory_recall_reply)
+        memory_recall_reply = localize_reply(memory_recall_reply, target_language)
+        memory_recall_reply = merge_witty_alert(memory_recall_reply, subscription_alert)
+        if remember_history:
+            conversation_history.append({"role": "user", "content": user_message})
+            conversation_history.append({"role": "assistant", "content": memory_recall_reply})
+            conversation_history = trim_history(conversation_history)
+            user_state = update_autonomous_learning(user_state, user_message, memory_recall_reply)
+            user_state["history"] = conversation_history
+            save_user_state(user_id, user_state)
+        elif alert_state_changed or sweep_changed:
+            save_user_state(user_id, user_state)
+        return memory_recall_reply
 
     normalized_user_message = normalize_intent_text(user_message)
     profile = user_state.get("profile") or {}
