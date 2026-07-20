@@ -3339,6 +3339,33 @@ def detect_comparison_priority(message):
     return "balanced"
 
 
+def build_price_comparison_table(quotes_by_symbol):
+    """Fallback: render simple price comparison when fundamentals unavailable."""
+    rows = [
+        "| Stock | Current Price | Change | Status |",
+        "| --- | ---: | ---: | --- |",
+    ]
+    for symbol, quote in quotes_by_symbol.items():
+        price = quote.get("price")
+        change = quote.get("change_percent")
+        name = quote.get("name") or symbol
+        
+        if price is None:
+            status_text = "price unavailable"
+        elif change is not None and change > 0:
+            status_text = "📈 up"
+        elif change is not None and change < 0:
+            status_text = "📉 down"
+        else:
+            status_text = "→ flat"
+        
+        price_str = f"${price:.2f}" if price else "—"
+        change_str = f"{change:+.2f}%" if change is not None else "—"
+        rows.append(f"| {symbol} | {price_str} | {change_str} | {status_text} |")
+    
+    return "\n".join(rows)
+
+
 def build_comparison_markdown_table(comparison_data):
     """Render side-by-side firm comparison from traceable metrics only."""
     rows = [
@@ -3433,7 +3460,29 @@ def get_firm_comparison_reply(normalized_text, original_text, include_sources=Fa
 
     request_trace_id = f"cmp-{int(time.time() * 1000)}-{secrets.token_hex(3)}"
     comparison_data, blocked = get_comparison_data(targets, request_trace_id=request_trace_id)
+    
+    # If we don't have full fundamental comparison data, try price-based fallback
     if len(comparison_data) < 2:
+        # Fallback: provide price comparison with whatever quote data we can get
+        symbols = []
+        for target in targets:
+            resolved = resolve_public_equity_symbol(target)
+            if resolved.get("ok"):
+                symbol = normalize_ticker_symbol(resolved.get("symbol") or "")
+                if symbol:
+                    symbols.append(symbol)
+        
+        if len(symbols) >= 2:
+            quotes, source_url = fetch_live_quotes(symbols)
+            if len(quotes) >= 2:
+                price_table = build_price_comparison_table(quotes)
+                fallback_reply = (
+                    f"Live price snapshot (fundamental metrics currently unavailable):\n\n{price_table}\n\n"
+                    "For deeper analysis, you can track these in your watchlist or ask about specific metrics."
+                )
+                return with_citations(fallback_reply, [source_url] if source_url else [], include_sources)
+        
+        # If even price comparison fails, return the original error message
         target_text = ", ".join(targets)
         non_public_targets = [row.get("target") for row in blocked if row.get("reason") in {"non-public-firm", "not-public-equity"}]
         if non_public_targets:
